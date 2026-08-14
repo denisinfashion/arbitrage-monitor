@@ -73,7 +73,22 @@ class Settings:
     """Глубина истории от текущего момента назад, в днях."""
 
     timeframe: str = "1m"
-    """Гранулярность свечей: 1m, 5m, 15m, 1h."""
+    """Гранулярность СБОРА: 1m, 5m, 15m, 1h.
+
+    Биржи отдают минутные свечи пачками по тысяче, поэтому здесь скупиться
+    незачем. Для DEX фактическая частота определяется расписанием сборщика.
+    """
+
+    analysis_timeframe: str = ""
+    """Гранулярность АНАЛИЗА. Пусто — совпадает с гранулярностью сбора.
+
+    Разделение понадобилось, когда выяснилось, что исторические свечи DEX
+    с раннеров GitHub недоступны: лимит GeckoTerminal считается по IP,
+    а раннеры делят адреса между тысячами проектов. Живые срезы при этом
+    приходят исправно, то есть по одной точке на пул за прогон. Биржи
+    продолжают отдавать минутные данные, и терять их незачем — просто
+    при анализе всё сводится в более крупные интервалы.
+    """
 
     # --- частота обновления ------------------------------------------------
     cex_refresh_sec: int = 60
@@ -103,14 +118,28 @@ class Settings:
     """Порог отсечения связок в таблице результатов."""
 
     # --- ключи (опционально) -----------------------------------------------
+    coingecko_api_key: str = os.environ.get("COINGECKO_API_KEY", "")
+    """Ключ CoinGecko. Со своим ключом квота считается по нему, а не по IP,
+    и исторические свечи DEX становятся доступны с общих раннеров."""
+
+    coingecko_plan: str = os.environ.get("COINGECKO_PLAN", "demo")
+    """demo (бесплатный) или pro — от этого зависит адрес и заголовок."""
+
     graph_api_key: str = os.environ.get("GRAPH_API_KEY", "")
     """Ключ The Graph для сабграфов PancakeSwap. Без него работает
     приближённая модель проскальзывания по reserve_in_usd от GeckoTerminal."""
 
-    def timeframe_seconds(self) -> int:
-        unit = self.timeframe[-1]
-        n = int(self.timeframe[:-1])
+    @staticmethod
+    def _tf_seconds(tf: str) -> int:
+        unit = tf[-1]
+        n = int(tf[:-1])
         return n * {"m": 60, "h": 3600, "d": 86400}[unit]
+
+    def timeframe_seconds(self) -> int:
+        return self._tf_seconds(self.timeframe)
+
+    def analysis_seconds(self) -> int:
+        return self._tf_seconds(self.analysis_timeframe or self.timeframe)
 
     def expected_candles(self) -> int:
         return int(self.history_days * 86400 / self.timeframe_seconds())

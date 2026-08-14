@@ -46,6 +46,13 @@ jobs:
           # Раннеры GitHub в США: Binance и Bybit отдают 451.
           # Список бирж переопределяется здесь без правки кода.
           ARB_CEX_VENUES: "okx,gate,mexc,kucoin"
+          # Необязательно. Без ключа лимит GeckoTerminal считается по IP,
+          # а раннеры делят адреса между тысячами проектов — исторические
+          # свечи DEX при этом почти всегда недоступны, остаются живые срезы.
+          # Со своим ключом квота считается по нему.
+          # Заводится в Settings -> Secrets and variables -> Actions.
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          COINGECKO_PLAN: demo
         run: |
           python cloud_collect.py --minutes 8 --days 7 --timeframe 1m --pools 100
 

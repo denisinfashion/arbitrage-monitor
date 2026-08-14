@@ -33,8 +33,30 @@ from ..store import Candle, get_last_ts, set_state, write_candles, write_pools
 
 log = logging.getLogger(__name__)
 
-API = "https://api.geckoterminal.com/api/v2"
+# Три способа обращаться к одним и тем же данным. Без ключа лимит считается
+# по IP, а раннеры GitHub делят адреса между тысячами проектов — квоту
+# выбирает кто угодно, и исторические свечи становятся недоступны. Со своим
+# ключом квота считается по нему, и общий адрес перестаёт мешать.
+PUBLIC_API = "https://api.geckoterminal.com/api/v2"
+DEMO_API = "https://api.coingecko.com/api/v3/onchain"
+PRO_API = "https://pro-api.coingecko.com/api/v3/onchain"
+
 HEADERS = {"Accept": "application/json;version=20230302"}
+
+
+def endpoint(settings=SETTINGS) -> Tuple[str, dict]:
+    """Адрес и заголовки под настроенный ключ."""
+    key = (settings.coingecko_api_key or "").strip()
+    if not key:
+        return PUBLIC_API, dict(HEADERS)
+    plan = (settings.coingecko_plan or "demo").strip().lower()
+    if plan == "pro":
+        return PRO_API, {**HEADERS, "x-cg-pro-api-key": key}
+    return DEMO_API, {**HEADERS, "x-cg-demo-api-key": key}
+
+
+# Совместимость со старым кодом и тестами
+API = PUBLIC_API
 
 MAX_FREE_PAGES = 10      # дальше требуется платный тариф
 POOLS_PER_PAGE = 20
@@ -84,6 +106,11 @@ class GeckoTerminalSource:
         self._pools: List[dict] = []
         self.last_backfill_complete = False
         """Очередь пулов дошла до конца и лимит не мешал."""
+        self.api, self.headers = endpoint(settings)
+        self.has_key = bool((settings.coingecko_api_key or "").strip())
+        if self.has_key:
+            log.info("%s: работаем с ключом CoinGecko (тариф %s)",
+                     self.name, settings.coingecko_plan)
 
     # ------------------------------------------------------------- discover
 
@@ -106,10 +133,10 @@ class GeckoTerminalSource:
         for page in range(1, need_pages + 1):
             try:
                 payload = get_json(
-                    f"{API}/networks/{self.chain}/pools",
+                    f"{self.api}/networks/{self.chain}/pools",
                     params={"page": page, "include": "base_token,quote_token,dex",
                             "sort": "h24_volume_usd_desc"},
-                    headers=HEADERS,
+                    headers=self.headers,
                 )
             except HttpError as exc:
                 set_state(self.name, "discover", ok=False, error=str(exc))
@@ -220,7 +247,7 @@ class GeckoTerminalSource:
         """История одного пула. Пагинация идёт назад через before_timestamp."""
         tf, agg = TIMEFRAME_MAP.get(self.s.timeframe, ("minute", 1))
         tf_sec = self.s.timeframe_seconds()
-        url = f"{API}/networks/{self.chain}/pools/{pool['pool']}/ohlcv/{tf}"
+        url = f"{self.api}/networks/{self.chain}/pools/{pool['pool']}/ohlcv/{tf}"
 
         out: List[Candle] = []
         cursor = until_ts
@@ -231,7 +258,7 @@ class GeckoTerminalSource:
                 url,
                 params={"aggregate": agg, "limit": MAX_CANDLES,
                         "before_timestamp": cursor, "currency": "usd", "token": "base"},
-                headers=HEADERS,
+                headers=self.headers,
             )
             rows = (((payload.get("data") or {}).get("attributes") or {})
                     .get("ohlcv_list") or [])
@@ -314,19 +341,25 @@ class GeckoTerminalSource:
             except HttpError as exc:
                 set_state(self.name + ":ohlcv", pool["pool"], ok=False, error=str(exc))
                 if exc.status == 429:
-                    # Лимит у GeckoTerminal считается по IP, а раннеры GitHub
-                    # делят адреса между проектами — квоту может выбрать
-                    # кто-то посторонний. Раньше здесь стоял break, и весь
-                    # бэкфилл обрывался после первого же отказа: за прогон
-                    # собиралось ноль свечей. Теперь выжидаем и продолжаем.
                     throttled += 1
-                    if throttled > 3:
-                        log.warning("GeckoTerminal держит лимит, "
-                                    "пропускаем DEX до следующего прогона")
+                    # Без ключа лимит считается по общему IP раннера, и ждать
+                    # почти всегда бессмысленно: на живом прогоне паузы
+                    # 20+40+60 секунд не помогли, зато съели три с половиной
+                    # минуты из восьми и оставили без данных биржу. Поэтому
+                    # без ключа сдаёмся сразу, а с ключом квота своя —
+                    # там отказ обычно временный и переждать стоит.
+                    limit = 3 if self.has_key else 1
+                    if throttled >= limit:
+                        log.warning(
+                            "GeckoTerminal держит лимит%s — история пулов "
+                            "в этот прогон не собирается%s",
+                            " даже с ключом" if self.has_key else " (общий IP раннера)",
+                            "" if self.has_key else
+                            ", живые срезы при этом работают",
+                        )
                         break
                     wait = 20.0 * throttled
-                    log.warning("лимит GeckoTerminal, пауза %.0f с "
-                                "(отказ %d из 3)", wait, throttled)
+                    log.warning("лимит GeckoTerminal, пауза %.0f с", wait)
                     time.sleep(wait)
                     continue
                 continue

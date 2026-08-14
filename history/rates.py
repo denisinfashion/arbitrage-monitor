@@ -152,6 +152,7 @@ def build_grid(
     max_assets: int = 80,
     apply_slippage: bool = True,
     spot_only: Optional[bool] = None,
+    bucket_seconds: Optional[int] = None,
 ) -> RateGrid:
     """Превращает таблицу котировок в сетку исполнимых курсов.
 
@@ -181,7 +182,11 @@ def build_grid(
             raise ValueError("после отсева токенов с плечом не осталось данных")
 
     trade = float(trade_size_usd if trade_size_usd is not None else settings.trade_size_usd)
-    tf = settings.timeframe_seconds()
+    # Гранулярность анализа отдельна от гранулярности сбора: биржи отдают
+    # минутные свечи, а DEX на бесплатной инфраструктуре обновляется раз
+    # в несколько минут. Сводим всё к общему интервалу, иначе строки DEX
+    # окажутся протухшими почти всегда и связки не найдутся.
+    tf = int(bucket_seconds or settings.analysis_seconds())
 
     # --- 1. Сетка времени -------------------------------------------------
     df["bucket"] = (df["ts"] // tf) * tf

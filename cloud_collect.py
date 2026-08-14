@@ -35,6 +35,13 @@ from history.snapshot import export_snapshot, import_snapshot
 
 log = logging.getLogger("cloud")
 
+CODE_VERSION = "2026-08-14.2"
+# Отметка версии в логе. Нужна из-за реального случая: прогон в CI дважды
+# шёл на старом коде — сперва потому, что коммит не был отправлен на сервер,
+# затем потому, что вместо нового запуска был повтор прежнего (повтор берёт
+# тот же коммит). По поведению это распознаётся не сразу, по строке в логе —
+# мгновенно.
+
 
 def setup_logging(verbose: bool = False) -> None:
     logging.basicConfig(
@@ -109,6 +116,10 @@ def main(argv=None) -> int:
     env_venues = os.environ.get("ARB_CEX_VENUES", "").strip()
     if env_venues:
         SETTINGS.cex_venues = [v.strip() for v in env_venues.split(",") if v.strip()]
+    sha = os.environ.get("GITHUB_SHA", "")
+    log.info("версия кода: %s | коммит: %s | событие: %s",
+             CODE_VERSION, sha[:7] or "локальный",
+             os.environ.get("GITHUB_EVENT_NAME", "запуск вручную"))
     log.info("биржи: %s", ", ".join(SETTINGS.cex_venues) or "нет")
 
     ensure_data_dir()
@@ -220,6 +231,7 @@ def main(argv=None) -> int:
     if summary:
         with open(summary, "a", encoding="utf-8") as f:
             f.write(f"### Сбор завершён\n\n")
+            f.write(f"Версия кода: `{CODE_VERSION}`\n\n")
             f.write(f"| Показатель | Значение |\n|---|---|\n")
             f.write(f"| Строк в базе | {after['rows']:,} |\n".replace(",", " "))
             f.write(f"| Прирост за прогон | {grew:+,} |\n".replace(",", " "))

@@ -65,6 +65,13 @@ with st.sidebar:
                                  SETTINGS.trade_size_usd, step=100.0,
                                  help="Под этот объём считается проскальзывание")
 
+    granularity = st.selectbox(
+        "Гранулярность анализа", ["1m", "5m", "15m", "1h"], index=2,
+        help="Шаг сетки времени. Биржи отдают минутные данные, а пулы DEX "
+             "на бесплатной инфраструктуре обновляются раз в несколько минут — "
+             "на мелком шаге строки DEX будут считаться протухшими и связки "
+             "через них не найдутся.")
+
     st.divider()
     kinds = st.multiselect("Типы площадок", ["dex", "cex"],
                            default=["dex"],
@@ -82,8 +89,8 @@ with st.sidebar:
                            help="Для DEX — точная формула по резерву пула. "
                                 "Для CEX — оценка по обороту свечи.")
 
-    staleness = st.slider("Допустимый возраст котировки, сек", 60, 900,
-                          SETTINGS.staleness_sec, step=30,
+    staleness = st.slider("Допустимый возраст котировки, сек", 60, 3600,
+                          1200, step=60,
                           help="Главный предохранитель от ложных связок: "
                                "цена старше этого порога в расчёт не идёт")
 
@@ -123,15 +130,16 @@ with st.sidebar:
 def compute(window_h: float, anchor: str, max_legs: int, trade_size: float,
             kinds: tuple, apply_slip: bool, staleness: int, gas_leg: float,
             max_assets: int, top_n: int, min_margin: float, sort_by: str,
-            spot_only: bool, _bust: int):
+            spot_only: bool, granularity: str, _bust: int):
     since = int(time.time() - window_h * 3600)
     quotes = snapshot.read_quotes(since_ts=since, venue_kinds=list(kinds))
     if quotes.empty:
         return None, None, None, "В выбранном окне нет котировок."
 
     s = SETTINGS
-    old_stale = s.staleness_sec
+    old_stale, old_tf = s.staleness_sec, s.analysis_timeframe
     s.staleness_sec = staleness
+    s.analysis_timeframe = granularity
     try:
         grid = build_grid(quotes, settings=s, trade_size_usd=trade_size,
                           venue_kinds=list(kinds), max_assets=max_assets,
@@ -147,7 +155,7 @@ def compute(window_h: float, anchor: str, max_legs: int, trade_size: float,
     except (ValueError, KeyError) as exc:
         return None, None, None, str(exc)
     finally:
-        s.staleness_sec = old_stale
+        s.staleness_sec, s.analysis_timeframe = old_stale, old_tf
     return grid, table, cycles, None
 
 
@@ -160,7 +168,7 @@ with st.spinner("Строю сетку курсов и ищу связки…"):
     grid, table, cycles, err = compute(
         window_h, anchor, max_legs, trade_size, tuple(kinds), apply_slip,
         staleness, gas_leg, max_assets, top_n, min_margin, sort_by, spot_only,
-        st.session_state.bust_paths,
+        granularity, st.session_state.bust_paths,
     )
 
 if err:
@@ -209,6 +217,7 @@ st.subheader(f"Связки, отсортированные по {SORT_LABEL.get
 st.caption(
     f"Окно {window_h:.0f} ч · объём ${trade_size:,.0f} · "
     f"газ ${gas_leg:.2f} за своп · допустимый возраст котировки {staleness} с"
+    + f" · шаг {granularity}"
     + (" · только спот" if spot_only else " · включая токены с плечом")
     .replace(",", " ")
 )
