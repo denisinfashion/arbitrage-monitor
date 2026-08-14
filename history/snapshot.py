@@ -67,7 +67,13 @@ def export_snapshot(path: Optional[Path] = None, days: Optional[float] = None) -
             "close", "volume", "liquidity_usd", "pool",
         ])
 
-    df.to_parquet(path, compression="zstd", index=False)
+    # Сортировка по времени и небольшие группы строк — то, что делает
+    # отбор по окну эффективным: читатель пропускает целые группы,
+    # не разжимая их.
+    if not df.empty and "ts" in df.columns:
+        df = df.sort_values("ts", kind="stable")
+    df.to_parquet(path, compression="zstd", index=False,
+                  row_group_size=50_000)
 
     pools = _all_pools()
     pools.to_parquet(path.with_name(POOLS_NAME), compression="zstd", index=False)
@@ -193,49 +199,127 @@ def fetch_remote(url: Optional[str] = None, ttl: Optional[int] = None) -> Option
     return local
 
 
+QUOTE_COLUMNS = ["ts", "venue", "venue_kind", "chain", "base", "quote",
+                 "close", "volume", "liquidity_usd", "pool"]
+
+
 def load_remote_quotes(since_ts: Optional[int] = None,
                        venue_kinds: Optional[list] = None) -> pd.DataFrame:
-    """Читает котировки из удалённого снимка — замена store.read_quotes
-    в облачном режиме."""
+    """Читает котировки из снимка — замена store.read_quotes в облаке.
+
+    Отбор передаётся внутрь читателя Parquet, а не применяется к уже
+    загруженному DataFrame. Разница принципиальна: снимок на два миллиона
+    строк при чтении целиком даёт пик под 750 МБ, а на бесплатном тарифе
+    Streamlit всего гигабайт — приложение падало бы ещё до построения
+    сетки курсов. С отбором по времени на уровне файла окно в 12 часов
+    занимает около 15 МБ.
+
+    Работает это потому, что снимок пишется отсортированным по времени:
+    группы строк внутри файла получаются непрерывными по ts, и читатель
+    пропускает целые группы, не разжимая их.
+    """
     path = fetch_remote()
     if path is None or not path.exists():
         return pd.DataFrame()
 
-    df = pd.read_parquet(path)
+    filters = []
+    if since_ts:
+        filters.append(("ts", ">=", int(since_ts)))
+    if venue_kinds:
+        filters.append(("venue_kind", "in", list(venue_kinds)))
+
+    try:
+        df = pd.read_parquet(path, columns=QUOTE_COLUMNS,
+                             filters=filters or None)
+    except Exception as exc:
+        log.warning("отбор на уровне файла не сработал (%s), читаю целиком", exc)
+        df = pd.read_parquet(path)
+        if since_ts:
+            df = df[df["ts"] >= int(since_ts)]
+        if venue_kinds:
+            df = df[df["venue_kind"].isin(venue_kinds)]
+
     if df.empty:
         return df
+    # Группы строк отбрасываются целиком, поэтому по краю окна могут
+    # просочиться лишние строки — дочищаем точно.
     if since_ts:
         df = df[df["ts"] >= int(since_ts)]
-    if venue_kinds:
-        df = df[df["venue_kind"].isin(venue_kinds)]
-    if not df.empty:
-        df = df.copy()
-        df["dt"] = pd.to_datetime(df["ts"], unit="s", utc=True)
+    df = df.copy()
+    df["dt"] = pd.to_datetime(df["ts"], unit="s", utc=True)
     return df
 
 
 def remote_stats() -> dict:
-    """Сводка по удалённому снимку — для страницы состояния."""
+    """Сводка по снимку без загрузки его целиком.
+
+    Число строк берётся из заголовка файла — данные для этого читать
+    не нужно вовсе. Остальное считается по четырём колонкам средствами
+    Arrow: его строковые массивы на порядок легче, чем объекты pandas.
+    """
     path = fetch_remote()
     if path is None or not path.exists():
         return {"rows": 0, "t0": None, "t1": None, "venues": 0, "pairs": 0,
                 "by_kind": {}, "db_mb": 0.0, "source": "remote", "ok": False}
 
-    df = pd.read_parquet(path)
-    if df.empty:
-        return {"rows": 0, "t0": None, "t1": None, "venues": 0, "pairs": 0,
-                "by_kind": {}, "db_mb": 0.0, "source": "remote", "ok": True}
+    empty = {"rows": 0, "t0": None, "t1": None, "venues": 0, "pairs": 0,
+             "by_kind": {}, "db_mb": round(path.stat().st_size / 1e6, 1),
+             "source": "remote", "ok": True}
+    try:
+        import pyarrow.compute as pc
+        import pyarrow.parquet as pq
+    except ImportError:
+        return empty
 
+    pf = pq.ParquetFile(path)
+    n_rows = pf.metadata.num_rows
+    if not n_rows:
+        return empty
+
+    # Границы времени берём из статистики групп строк — сама колонка
+    # при этом не читается.
+    t0 = t1 = None
+    try:
+        md = pf.metadata
+        for g in range(md.num_row_groups):
+            col = md.row_group(g).column(0)      # ts идёт первой
+            if not col.is_stats_set:
+                t0 = None
+                break
+            st = col.statistics
+            t0 = st.min if t0 is None else min(t0, st.min)
+            t1 = st.max if t1 is None else max(t1, st.max)
+    except Exception:
+        t0 = None
+
+    tbl = pq.read_table(path, columns=["ts", "venue", "venue_kind",
+                                       "base", "quote"])
+    if t0 is None:
+        t0 = pc.min(tbl.column("ts")).as_py()
+        t1 = pc.max(tbl.column("ts")).as_py()
+
+    # Всё считаем средствами Arrow. Соблазн вызвать to_pylist() велик,
+    # но на двух миллионах строк это создаёт шесть миллионов объектов
+    # Python и разносит память сильнее, чем чтение файла целиком.
+    kind_stats = tbl.group_by("venue_kind").aggregate(
+        [("venue", "count_distinct"), ("ts", "count")])
     by_kind = {}
-    for kind, grp in df.groupby("venue_kind"):
-        by_kind[kind] = {"rows": len(grp), "venues": grp["venue"].nunique()}
+    kinds = kind_stats.column("venue_kind")
+    n_ven = kind_stats.column("venue_count_distinct")
+    n_row = kind_stats.column("ts_count")
+    for i in range(kind_stats.num_rows):
+        by_kind[kinds[i].as_py()] = {"rows": n_row[i].as_py(),
+                                     "venues": n_ven[i].as_py()}
+
+    venues = pc.count_distinct(tbl.column("venue")).as_py()
+    pairs = tbl.group_by(["base", "quote"]).aggregate([]).num_rows
 
     return {
-        "rows": len(df),
-        "t0": int(df["ts"].min()),
-        "t1": int(df["ts"].max()),
-        "venues": int(df["venue"].nunique()),
-        "pairs": int((df["base"] + "/" + df["quote"]).nunique()),
+        "rows": n_rows,
+        "t0": int(t0),
+        "t1": int(t1),
+        "venues": int(venues),
+        "pairs": int(pairs),
         "by_kind": by_kind,
         "db_mb": round(path.stat().st_size / 1e6, 1),
         "source": "remote",
@@ -312,19 +396,26 @@ def coverage() -> pd.DataFrame:
         path = fetch_remote()
         if path is None or not path.exists():
             return pd.DataFrame()
-        df = pd.read_parquet(path)
-        if df.empty:
+        try:
+            import pyarrow.parquet as pq
+        except ImportError:
             return pd.DataFrame()
-        agg = df.groupby(["venue", "venue_kind"]).agg(
-            Свечей=("ts", "size"),
-            t0=("ts", "min"),
-            t1=("ts", "max"),
-        ).reset_index()
-        pairs = (df.assign(_p=df["base"] + "/" + df["quote"])
-                   .groupby(["venue", "venue_kind"])["_p"].nunique()
-                   .reset_index(name="Пар"))
+        # Группировка средствами Arrow: полное чтение снимка в pandas
+        # не помещается в память бесплатного тарифа.
+        tbl = pq.read_table(path, columns=["ts", "venue", "venue_kind",
+                                           "base", "quote"])
+        if tbl.num_rows == 0:
+            return pd.DataFrame()
+        agg = tbl.group_by(["venue", "venue_kind"]).aggregate(
+            [("ts", "count"), ("ts", "min"), ("ts", "max")]).to_pandas()
+        pairs = (tbl.group_by(["venue", "venue_kind", "base", "quote"])
+                    .aggregate([]).to_pandas()
+                    .groupby(["venue", "venue_kind"]).size()
+                    .reset_index(name="Пар"))
         out = agg.merge(pairs, on=["venue", "venue_kind"])
-        out = out.rename(columns={"venue": "Площадка", "venue_kind": "Тип"})
+        out = out.rename(columns={"venue": "Площадка", "venue_kind": "Тип",
+                                  "ts_count": "Свечей",
+                                  "ts_min": "t0", "ts_max": "t1"})
         return out.sort_values("Свечей", ascending=False)
 
     conn = store.connect(read_only=True)

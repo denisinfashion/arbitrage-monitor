@@ -16,7 +16,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from ..config import CEX_TAKER_PCT, SETTINGS, is_leveraged_token, norm_asset
+from ..config import (CEX_MAX_HISTORY_CANDLES, CEX_MAX_WORKERS, CEX_TAKER_PCT,
+                      DEFAULT_CEX_WORKERS, SETTINGS, is_leveraged_token, norm_asset)
 from ..store import Candle, get_last_ts, set_state, write_candles, write_fees
 
 log = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ class CexSource:
         self.ex = cls({"enableRateLimit": True, "timeout": 20000})
         self._symbols: List[str] = []
         self._markets_loaded = False
+        self._depth_capped = False
 
     # ---------------------------------------------------------------- utils
 
@@ -151,10 +153,9 @@ class CexSource:
         guard = 0
         while cursor < until_ms and guard < 200:
             guard += 1
-            try:
-                batch = self.ex.fetch_ohlcv(symbol, tf, since=cursor, limit=MAX_CANDLES_PER_CALL)
-            except Exception as exc:
-                raise RuntimeError(f"{symbol}: {type(exc).__name__} {exc}") from exc
+            batch = self._fetch_batch(symbol, tf, cursor)
+            if batch is None:
+                break
             if not batch:
                 break
             for ts_ms, o, h, l, c, v in batch:
@@ -173,20 +174,106 @@ class CexSource:
                 break
         return out
 
+    def _fetch_batch(self, symbol: str, tf: str, cursor: int):
+        """Один запрос свечей с повторами при отказе по лимиту.
+
+        Троттлинг ccxt рассчитан на последовательные вызовы: несколько
+        потоков на одном объекте биржи сверяются с общей меткой времени
+        и стреляют одновременно. OKX на живом прогоне отдал 50011
+        (Too Many Requests) по 75 парам из 200. Помимо снижения
+        параллелизма нужен и повтор с нарастающей паузой — квота
+        восстанавливается за секунды.
+
+        Возвращает список свечей, либо None, если пару надо пропустить
+        (историю глубже биржа не отдаёт).
+        """
+        attempts = 4
+        delay = 1.0
+        for attempt in range(attempts):
+            try:
+                return self.ex.fetch_ohlcv(symbol, tf, since=cursor,
+                                           limit=MAX_CANDLES_PER_CALL)
+            except Exception as exc:
+                name = type(exc).__name__
+                text = str(exc)
+
+                # Биржа сообщает, что запрошенная глубина недоступна.
+                # Запоминаем ограничение, чтобы не долбиться по каждой паре.
+                if self._is_depth_error(text):
+                    self._note_depth_limit()
+                    return None
+
+                if name in ("RateLimitExceeded", "DDoSProtection"):
+                    if attempt + 1 < attempts:
+                        time.sleep(delay)
+                        delay *= 2.5
+                        continue
+                    raise RuntimeError(
+                        f"{symbol}: лимит запросов биржи не отпустил "
+                        f"за {attempts} попытки"
+                    ) from exc
+
+                raise RuntimeError(f"{symbol}: {name} {text}") from exc
+
+        raise RuntimeError(f"{symbol}: не удалось получить свечи")
+
+    @staticmethod
+    def _is_depth_error(text: str) -> bool:
+        t = text.lower()
+        return ("too long ago" in t or "maximum" in t and "points" in t
+                or "too old" in t)
+
+    def _note_depth_limit(self) -> None:
+        """Запоминает, что биржа не отдаёт запрошенную глубину."""
+        if self._depth_capped:
+            return
+        self._depth_capped = True
+        log.warning("%s: глубина ограничена самой биржей, "
+                    "следующие запросы укоротим", self.name)
+
+    def _max_history_candles(self) -> Optional[int]:
+        cap = CEX_MAX_HISTORY_CANDLES.get(self.name)
+        if self._depth_capped:
+            # Известного значения нет, но биржа отказала — берём безопасное.
+            cap = min(cap or 9_800, 9_800)
+        return cap
+
+    def _clamp_since(self, since_ms: int, until_ms: int) -> int:
+        """Не просим глубже, чем биржа готова отдать."""
+        cap = self._max_history_candles()
+        if not cap:
+            return since_ms
+        tf_ms = self.s.timeframe_seconds() * 1000
+        earliest = until_ms - cap * tf_ms
+        if since_ms < earliest:
+            log.info("%s: глубина урезана до %d свечей (%.1f дн) — ограничение биржи",
+                     self.name, cap, cap * tf_ms / 86_400_000)
+            return earliest
+        return since_ms
+
     # -------------------------------------------------------------- backfill
 
-    def backfill(self, days: Optional[float] = None, max_workers: int = 4) -> int:
+    def _workers(self, requested: Optional[int]) -> int:
+        if requested is not None:
+            return requested
+        return CEX_MAX_WORKERS.get(self.name, DEFAULT_CEX_WORKERS)
+
+    def backfill(self, days: Optional[float] = None,
+                 max_workers: Optional[int] = None) -> int:
         """Первичная загрузка истории заданной глубины."""
         days = days if days is not None else self.s.history_days
         until_ms = int(time.time() * 1000)
-        since_ms = until_ms - int(days * 86400 * 1000)
-        return self._run(since_ms, until_ms, max_workers, mode="backfill")
+        since_ms = self._clamp_since(until_ms - int(days * 86400 * 1000), until_ms)
+        return self._run(since_ms, until_ms, self._workers(max_workers),
+                         mode="backfill")
 
-    def update(self, max_workers: int = 4) -> int:
+    def update(self, max_workers: Optional[int] = None) -> int:
         """Инкрементальная докачка от последней собранной свечи."""
         until_ms = int(time.time() * 1000)
-        default_since = until_ms - int(self.s.history_days * 86400 * 1000)
-        return self._run(None, until_ms, max_workers, mode="update", default_since_ms=default_since)
+        default_since = self._clamp_since(
+            until_ms - int(self.s.history_days * 86400 * 1000), until_ms)
+        return self._run(None, until_ms, self._workers(max_workers),
+                         mode="update", default_since_ms=default_since)
 
     def _run(self, since_ms: Optional[int], until_ms: int, max_workers: int,
              mode: str, default_since_ms: Optional[int] = None) -> int:
@@ -204,6 +291,7 @@ class CexSource:
             if start is None:
                 last = get_last_ts("cex:" + self.name, symbol)
                 start = (last * 1000 + tf_ms) if last else (default_since_ms or 0)
+                start = self._clamp_since(start, until_ms)
             if start >= until_ms:
                 return symbol, 0, None
             try:

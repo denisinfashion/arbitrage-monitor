@@ -156,6 +156,78 @@ def main() -> int:
     check("data_available отвечает честно", snapshot.data_available() is False)
     del os.environ[snapshot.ENV_SNAPSHOT_URL]
 
+    # ------------------------------------------------- масштаб и память
+    print("\n7. Большой снимок: отбор на уровне файла")
+
+    import resource
+    import numpy as np
+
+    def rss_mb():
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+    # Живой прогон в GitHub Actions дал два миллиона строк. Чтение такого
+    # снимка целиком в pandas давало пик под 750 МБ, а бесплатный тариф
+    # Streamlit ограничен гигабайтом — приложение падало бы до расчёта.
+    BIG, base_t = 300_000, now - 7 * 86400
+    rng = np.random.default_rng(5)
+    # Тип площадки определяется её именем, а не бросается монеткой:
+    # иначе одна биржа попадёт и в cex, и в dex, и группировка честно
+    # вернёт вдвое больше строк, чем площадок.
+    VENUES = {"okx": "cex", "mexc": "cex",
+              "pancakeswap_v3": "dex", "biswap": "dex"}
+    venue_col = rng.choice(list(VENUES), BIG)
+    kind_col = np.array([VENUES[v] for v in venue_col])
+    big = pd.DataFrame({
+        "ts": np.sort(rng.integers(base_t, now, BIG)),
+        "venue": venue_col,
+        "venue_kind": kind_col,
+        "chain": np.where(kind_col == "dex", "bsc", ""),
+        "base": rng.choice([f"T{i}" for i in range(120)], BIG),
+        "quote": rng.choice(["USDT", "USDC", "BNB"], BIG),
+        "close": rng.uniform(0.01, 70000, BIG),
+        "volume": rng.uniform(1, 1e6, BIG),
+        "liquidity_usd": rng.uniform(1e5, 1e7, BIG),
+        "pool": rng.choice(["0xa", "0xb", None], BIG),
+    })
+    big_path = DATA_DIR / f"remote_{snapshot.SNAPSHOT_NAME}"
+    big.to_parquet(big_path, compression="zstd", index=False,
+                   row_group_size=50_000)
+    del big
+
+    os.environ[snapshot.ENV_SNAPSHOT_URL] = "file://big"
+    real_fetch = snapshot.fetch_remote
+    snapshot.fetch_remote = lambda *a, **k: big_path
+    try:
+        before_mb = rss_mb()
+        st = snapshot.stats()
+        check("сводка по большому снимку верна", st["rows"] == BIG,
+              f"{st['rows']} против {BIG}")
+        check("границы времени определены", st["t0"] and st["t1"])
+        check("площадки посчитаны", st["venues"] == 4, str(st["venues"]))
+
+        win = snapshot.read_quotes(since_ts=now - 12 * 3600, venue_kinds=["dex"])
+        share = len(win) / BIG
+        check("окно заметно меньше снимка", share < 0.15,
+              f"{len(win)} строк, {share*100:.0f}% файла")
+        check("фильтр по типу применён на уровне файла",
+              set(win["venue_kind"]) == {"dex"})
+        size_mb = win.memory_usage(deep=True).sum() / 1e6
+        check("окно компактно в памяти", size_mb < 20, f"{size_mb:.1f} МБ")
+
+        cov = snapshot.coverage()
+        check("покрытие считается по большому снимку", len(cov) == 4,
+              f"{len(cov)} площадок")
+        check("в покрытии нужные колонки",
+              {"Площадка", "Тип", "Свечей", "Пар"} <= set(cov.columns),
+              str(list(cov.columns)))
+
+        grew = rss_mb() - before_mb
+        check("память не взлетела", grew < 400, f"прирост {grew:.0f} МБ")
+        print(f"      пик процесса: {rss_mb():.0f} МБ")
+    finally:
+        snapshot.fetch_remote = real_fetch
+        os.environ.pop(snapshot.ENV_SNAPSHOT_URL, None)
+
     print("\n" + "=" * 70)
     if FAILED:
         print(f"ПРОВАЛЕНО {len(FAILED)}:")

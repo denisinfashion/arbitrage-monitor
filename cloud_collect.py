@@ -147,6 +147,41 @@ def main(argv=None) -> int:
             log.warning("CEX %s пропущена", src.name)
     log.info("бирж доступно: %d из %d", len(alive), len(c.cex))
 
+    # Порядок важен. На первом живом прогоне биржи съели почти всё время
+    # (одна только KuCoin отдала 1.9 млн свечей за три минуты), и на DEX
+    # осталось четырнадцать секунд — история пулов не собралась вовсе.
+    # Между тем DEX и есть цель: сеть BNB, обмен без переводов. Биржи же
+    # дотягиваются инкрементально за секунды на следующих прогонах.
+    # Поэтому DEX получает гарантированную половину времени первым.
+    dex_deadline = time.time() + (deadline - time.time()) * 0.5
+
+    def collect_dex(until_ts: float) -> int:
+        if not c.dex:
+            return 0
+        total = 0
+        while time.time() < until_ts - 20:
+            n = run_bounded("DEX backfill",
+                            lambda: c.dex.backfill(budget_requests=25),
+                            min(180.0, until_ts - time.time()), default=-1)
+            if n < 0:
+                break
+            total += n
+            log.info("DEX: +%d свечей (всего %d), осталось %.0f с",
+                     n, total, until_ts - time.time())
+            # Ноль свечей раньше трактовался как «история набрана», хотя это
+            # же значение возвращается и когда нас придержали по лимиту.
+            # Теперь источник сообщает об этом явно.
+            if n == 0:
+                if getattr(c.dex, "last_backfill_complete", False):
+                    log.info("история пулов набрана на нужную глубину")
+                else:
+                    log.info("прогресса нет — вероятно лимит, "
+                             "продолжим на следующем прогоне")
+                break
+        return total
+
+    collect_dex(dex_deadline)
+
     # Инкремент по биржам: если истории нет, backfill наберёт её за раз,
     # если есть — доберётся только свежее.
     for src in alive:
@@ -157,19 +192,8 @@ def main(argv=None) -> int:
         n = run_bounded(f"CEX {src.name} сбор", fn, min(180.0, left()))
         log.info("CEX %s: +%d свечей", src.name, n)
 
-    # DEX: живой срез уже сделан, добираем историю пулов столько,
-    # сколько успеваем.
-    if c.dex:
-        while left() > 30:
-            n = run_bounded("DEX backfill",
-                            lambda: c.dex.backfill(budget_requests=25),
-                            min(180.0, left()), default=-1)
-            if n < 0:
-                break
-            log.info("DEX: +%d свечей, осталось %.0f с", n, left())
-            if n == 0:
-                log.info("история пулов набрана на нужную глубину")
-                break
+    # Если после бирж время осталось — доберём ещё пулов.
+    collect_dex(deadline)
 
     # --- 3. Обрезаем и выгружаем -----------------------------------------
     cutoff = int(time.time() - SETTINGS.history_days * 86400)

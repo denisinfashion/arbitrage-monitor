@@ -24,7 +24,7 @@ USER_AGENT = "arb-calculator/2.0"
 # Минимальный интервал между запросами к одному хосту, секунды.
 # GeckoTerminal: 30 запросов/мин на бесплатном тарифе -> 2.0 с с запасом.
 MIN_INTERVAL: Dict[str, float] = {
-    "api.geckoterminal.com": 2.1,
+    "api.geckoterminal.com": 2.6,   # лимит 30/мин по IP, а на раннерах GitHub адрес общий
     "pro-api.coingecko.com": 0.6,
     "api.coingecko.com": 2.5,
     "gateway.thegraph.com": 0.2,

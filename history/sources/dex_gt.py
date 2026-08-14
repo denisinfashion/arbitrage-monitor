@@ -82,6 +82,8 @@ class GeckoTerminalSource:
         self.name = f"gt:{settings.chain}"
         self.chain = settings.chain
         self._pools: List[dict] = []
+        self.last_backfill_complete = False
+        """Очередь пулов дошла до конца и лимит не мешал."""
 
     # ------------------------------------------------------------- discover
 
@@ -301,6 +303,8 @@ class GeckoTerminalSource:
 
         pending.sort(key=lambda x: -x[0])  # сперва те, у кого истории меньше
         total, spent = 0, 0
+        throttled = 0
+        self.last_backfill_complete = False
 
         for edge, pool in pending:
             if spent >= budget_requests:
@@ -310,8 +314,21 @@ class GeckoTerminalSource:
             except HttpError as exc:
                 set_state(self.name + ":ohlcv", pool["pool"], ok=False, error=str(exc))
                 if exc.status == 429:
-                    log.warning("лимит GeckoTerminal, бэкфилл прерван")
-                    break
+                    # Лимит у GeckoTerminal считается по IP, а раннеры GitHub
+                    # делят адреса между проектами — квоту может выбрать
+                    # кто-то посторонний. Раньше здесь стоял break, и весь
+                    # бэкфилл обрывался после первого же отказа: за прогон
+                    # собиралось ноль свечей. Теперь выжидаем и продолжаем.
+                    throttled += 1
+                    if throttled > 3:
+                        log.warning("GeckoTerminal держит лимит, "
+                                    "пропускаем DEX до следующего прогона")
+                        break
+                    wait = 20.0 * throttled
+                    log.warning("лимит GeckoTerminal, пауза %.0f с "
+                                "(отказ %d из 3)", wait, throttled)
+                    time.sleep(wait)
+                    continue
                 continue
             spent += max(1, len(candles) // MAX_CANDLES + 1)
             if not candles:
@@ -324,8 +341,11 @@ class GeckoTerminalSource:
             set_state(self.name + ":ohlcv_first", pool["pool"],
                       last_ts=min(c.ts for c in candles), ok=True)
 
-        log.info("%s: бэкфилл %d свечей, %d пулов в очереди",
-                 self.name, total, max(0, len(pending) - spent))
+        remaining = max(0, len(pending) - spent)
+        self.last_backfill_complete = (remaining == 0 and throttled == 0)
+        log.info("%s: бэкфилл %d свечей, %d пулов в очереди%s",
+                 self.name, total, remaining,
+                 f", отказов по лимиту: {throttled}" if throttled else "")
         return total
 
     def update(self) -> int:
