@@ -1,0 +1,333 @@
+"""История DEX через публичный API GeckoTerminal.
+
+Бесплатный тариф: 30 запросов/мин, ключ не нужен. Из этого следует
+двухуровневая схема сбора, иначе в лимит не уложиться:
+
+  Уровень «живой» — эндпоинт top-pools отдаёт СРАЗУ 20 пулов за запрос,
+  и в каждом уже есть текущая цена обоих токенов и резерв пула.
+  100 пулов = 5 запросов = ~10 секунд. Это даёт свежесть.
+
+  Уровень «история» — OHLCV запрашивается по одному пулу за раз
+  (до 1000 свечей). 7 дней минутных свечей = 11 запросов на пул,
+  на 100 пулов это ~1100 запросов ≈ 38 минут. Поэтому бэкфилл идёт
+  фоном и по кругу, а не блокирует старт.
+
+Важное про проскальзывание: OHLCV даёт только цену сделок без глубины.
+Но top-pools отдаёт reserve_in_usd, и для пулов постоянного произведения
+(V2) этого достаточно, чтобы восстановить price impact точно:
+    amount_out = R_out * S / (R_in + S)
+Для V3 концентрированная ликвидность около спота глубже, чем следует
+из общего TVL, поэтому оценка получается консервативной — занижает
+исполнимый объём. Для арбитража это безопасная сторона ошибки.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from typing import Dict, List, Optional, Tuple
+
+from ..config import DEX_POOL_FEE_PCT, SETTINGS, norm_asset
+from ..http import HttpError, get_json
+from ..store import Candle, get_last_ts, set_state, write_candles, write_pools
+
+log = logging.getLogger(__name__)
+
+API = "https://api.geckoterminal.com/api/v2"
+HEADERS = {"Accept": "application/json;version=20230302"}
+
+MAX_FREE_PAGES = 10      # дальше требуется платный тариф
+POOLS_PER_PAGE = 20
+MAX_CANDLES = 1000
+
+# ccxt-таймфрейм -> (timeframe, aggregate) в терминах GeckoTerminal
+TIMEFRAME_MAP: Dict[str, Tuple[str, int]] = {
+    "1m": ("minute", 1),
+    "5m": ("minute", 5),
+    "15m": ("minute", 15),
+    "1h": ("hour", 1),
+    "4h": ("hour", 4),
+    "12h": ("hour", 12),
+    "1d": ("day", 1),
+}
+
+
+def _f(value) -> Optional[float]:
+    """GeckoTerminal отдаёт числа строками, иногда null."""
+    if value is None or value == "":
+        return None
+    try:
+        v = float(value)
+        return v if v == v else None  # отсекаем NaN
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_pool_name(name: str) -> Tuple[str, str]:
+    """'WBNB / USDT 0.05%' -> ('WBNB', 'USDT'). Запасной путь, если
+    include=base_token,quote_token не отработал."""
+    if not name or "/" not in name:
+        return "", ""
+    left, _, right = name.partition("/")
+    return left.strip().upper(), right.strip().split()[0].upper() if right.strip() else ""
+
+
+class GeckoTerminalSource:
+    """Сборщик котировок DEX по одной сети."""
+
+    kind = "dex"
+
+    def __init__(self, settings=SETTINGS):
+        self.s = settings
+        self.name = f"gt:{settings.chain}"
+        self.chain = settings.chain
+        self._pools: List[dict] = []
+
+    # ------------------------------------------------------------- discover
+
+    def discover(self) -> int:
+        """Читает топ пулов сети и сохраняет их в справочник.
+
+        Один запрос возвращает 20 пулов вместе с текущими ценами
+        и резервами, поэтому этот же вызов работает как «живой» срез.
+        """
+        need_pages = min(
+            MAX_FREE_PAGES,
+            max(1, -(-self.s.dex_pool_limit // POOLS_PER_PAGE)),
+        )
+        pools: List[dict] = []
+        candles: List[Candle] = []
+        now = int(time.time())
+        tf_sec = self.s.timeframe_seconds()
+        bucket = now - (now % tf_sec)
+
+        for page in range(1, need_pages + 1):
+            try:
+                payload = get_json(
+                    f"{API}/networks/{self.chain}/pools",
+                    params={"page": page, "include": "base_token,quote_token,dex",
+                            "sort": "h24_volume_usd_desc"},
+                    headers=HEADERS,
+                )
+            except HttpError as exc:
+                set_state(self.name, "discover", ok=False, error=str(exc))
+                log.warning("discover страница %d: %s", page, exc)
+                break
+
+            tokens = self._index_included(payload.get("included", []))
+            page_items = payload.get("data", []) or []
+            if not page_items:
+                break
+
+            for item in page_items:
+                parsed = self._parse_pool(item, tokens)
+                if parsed is None:
+                    continue
+                pools.append(parsed)
+                snap = self._live_candle(parsed, bucket)
+                if snap:
+                    candles.append(snap)
+
+        # отсев по ликвидности и обрезка до лимита
+        pools = [p for p in pools if (p["reserve_usd"] or 0) >= self.s.min_pool_reserve_usd]
+        pools.sort(key=lambda p: p["reserve_usd"] or 0, reverse=True)
+        pools = pools[: self.s.dex_pool_limit]
+        keep = {p["pool"] for p in pools}
+
+        write_pools(pools)
+        written = write_candles([c for c in candles if c.pool in keep])
+        self._pools = pools
+
+        set_state(self.name, "discover", ok=bool(pools),
+                  error="" if pools else "пулы не получены", rows=written)
+        log.info("%s: %d пулов под наблюдением, %d живых котировок",
+                 self.name, len(pools), written)
+        return len(pools)
+
+    def _index_included(self, included: List[dict]) -> Dict[str, dict]:
+        """id -> объект для секции included (токены и dex)."""
+        return {obj.get("id", ""): obj for obj in included}
+
+    def _parse_pool(self, item: dict, tokens: Dict[str, dict]) -> Optional[dict]:
+        attrs = item.get("attributes", {}) or {}
+        rel = item.get("relationships", {}) or {}
+        address = attrs.get("address")
+        if not address:
+            return None
+
+        def tok(side: str) -> Tuple[str, str]:
+            ref = ((rel.get(side) or {}).get("data") or {}).get("id", "")
+            obj = tokens.get(ref) or {}
+            a = obj.get("attributes", {}) or {}
+            sym = (a.get("symbol") or "").upper()
+            addr = a.get("address") or (ref.split("_", 1)[-1] if "_" in ref else "")
+            return sym, addr
+
+        base_sym, base_addr = tok("base_token")
+        quote_sym, quote_addr = tok("quote_token")
+        if not base_sym or not quote_sym:
+            base_sym, quote_sym = _parse_pool_name(attrs.get("name", ""))
+        if not base_sym or not quote_sym:
+            return None
+
+        dex_id = ((rel.get("dex") or {}).get("data") or {}).get("id", "") or "unknown"
+
+        return {
+            "chain": self.chain,
+            "pool": address,
+            "dex": dex_id,
+            "base": norm_asset(base_sym),
+            "quote": norm_asset(quote_sym),
+            "base_addr": base_addr,
+            "quote_addr": quote_addr,
+            "reserve_usd": _f(attrs.get("reserve_in_usd")),
+            "volume_24h": _f((attrs.get("volume_usd") or {}).get("h24")),
+            "fee_pct": DEX_POOL_FEE_PCT.get(dex_id, DEX_POOL_FEE_PCT["default"]),
+            # не пишется в таблицу pools, используется ниже
+            "_base_usd": _f(attrs.get("base_token_price_usd")),
+            "_quote_usd": _f(attrs.get("quote_token_price_usd")),
+        }
+
+    def _live_candle(self, pool: dict, ts: int) -> Optional[Candle]:
+        """Текущая цена из top-pools как свеча текущего интервала."""
+        b, q = pool.get("_base_usd"), pool.get("_quote_usd")
+        if not b or not q or q <= 0:
+            return None
+        return Candle(
+            ts=ts, venue=pool["dex"], venue_kind="dex", chain=self.chain,
+            base=pool["base"], quote=pool["quote"],
+            close=b / q, liquidity_usd=pool["reserve_usd"], pool=pool["pool"],
+        )
+
+    # ------------------------------------------------------------ pool list
+
+    @property
+    def pools(self) -> List[dict]:
+        if not self._pools:
+            from ..store import read_pools
+            df = read_pools(self.chain, self.s.min_pool_reserve_usd)
+            if not df.empty:
+                self._pools = df.head(self.s.dex_pool_limit).to_dict("records")
+            else:
+                self.discover()
+        return self._pools
+
+    # -------------------------------------------------------------- OHLCV
+
+    def _fetch_ohlcv(self, pool: dict, since_ts: int, until_ts: int) -> List[Candle]:
+        """История одного пула. Пагинация идёт назад через before_timestamp."""
+        tf, agg = TIMEFRAME_MAP.get(self.s.timeframe, ("minute", 1))
+        tf_sec = self.s.timeframe_seconds()
+        url = f"{API}/networks/{self.chain}/pools/{pool['pool']}/ohlcv/{tf}"
+
+        out: List[Candle] = []
+        cursor = until_ts
+        guard = 0
+        while cursor > since_ts and guard < 40:
+            guard += 1
+            payload = get_json(
+                url,
+                params={"aggregate": agg, "limit": MAX_CANDLES,
+                        "before_timestamp": cursor, "currency": "usd", "token": "base"},
+                headers=HEADERS,
+            )
+            rows = (((payload.get("data") or {}).get("attributes") or {})
+                    .get("ohlcv_list") or [])
+            if not rows:
+                break
+
+            # currency=usd отдаёт цену базового токена в долларах.
+            # Курс base->quote получаем делением на цену quote в долларах,
+            # которую берём из последнего живого среза пула.
+            quote_usd = pool.get("_quote_usd") or self._quote_usd_hint(pool)
+            if not quote_usd or quote_usd <= 0:
+                break
+
+            oldest = cursor
+            for ts, o, h, l, c, v in rows:
+                ts = int(ts)
+                oldest = min(oldest, ts)
+                if ts < since_ts or not c or c <= 0:
+                    continue
+                out.append(Candle(
+                    ts=ts, venue=pool["dex"], venue_kind="dex", chain=self.chain,
+                    base=pool["base"], quote=pool["quote"],
+                    open=(o / quote_usd) if o else None,
+                    high=(h / quote_usd) if h else None,
+                    low=(l / quote_usd) if l else None,
+                    close=float(c) / quote_usd,
+                    volume=v,
+                    liquidity_usd=pool.get("reserve_usd"),
+                    pool=pool["pool"],
+                ))
+            if oldest >= cursor or len(rows) < MAX_CANDLES:
+                break
+            cursor = oldest - tf_sec
+        return out
+
+    def _quote_usd_hint(self, pool: dict) -> Optional[float]:
+        """Если котируемый токен — стейбл, его цена ≈ 1. Иначе пробуем
+        взять последнюю известную цену из базы."""
+        from ..config import USD_LIKE
+        if pool.get("quote") in USD_LIKE:
+            return 1.0
+        from ..store import connect
+        row = connect(read_only=True).execute(
+            "SELECT close FROM quotes WHERE base=? AND quote IN ('USDT','USDC','BUSD') "
+            "ORDER BY ts DESC LIMIT 1", (pool.get("quote"),)
+        ).fetchone()
+        return float(row["close"]) if row else None
+
+    # ------------------------------------------------------------- backfill
+
+    def backfill(self, days: Optional[float] = None, budget_requests: int = 120) -> int:
+        """Дотягивает историю по пулам, у которых её меньше всего.
+
+        budget_requests ограничивает число запросов за один заход,
+        чтобы фоновый бэкфилл не съедал весь лимит и «живой» уровень
+        продолжал обновляться.
+        """
+        days = days if days is not None else self.s.history_days
+        until = int(time.time())
+        since = until - int(days * 86400)
+
+        pending = []
+        for p in self.pools:
+            last = get_last_ts(self.name + ":ohlcv", p["pool"])
+            first = get_last_ts(self.name + ":ohlcv_first", p["pool"])
+            if first and first <= since + self.s.timeframe_seconds() * 2:
+                continue  # история набрана на нужную глубину
+            pending.append((first or until, p))
+
+        pending.sort(key=lambda x: -x[0])  # сперва те, у кого истории меньше
+        total, spent = 0, 0
+
+        for edge, pool in pending:
+            if spent >= budget_requests:
+                break
+            try:
+                candles = self._fetch_ohlcv(pool, since, int(edge))
+            except HttpError as exc:
+                set_state(self.name + ":ohlcv", pool["pool"], ok=False, error=str(exc))
+                if exc.status == 429:
+                    log.warning("лимит GeckoTerminal, бэкфилл прерван")
+                    break
+                continue
+            spent += max(1, len(candles) // MAX_CANDLES + 1)
+            if not candles:
+                set_state(self.name + ":ohlcv_first", pool["pool"], last_ts=since, ok=True)
+                continue
+            n = write_candles(candles)
+            total += n
+            set_state(self.name + ":ohlcv", pool["pool"],
+                      last_ts=max(c.ts for c in candles), ok=True, rows=n)
+            set_state(self.name + ":ohlcv_first", pool["pool"],
+                      last_ts=min(c.ts for c in candles), ok=True)
+
+        log.info("%s: бэкфилл %d свечей, %d пулов в очереди",
+                 self.name, total, max(0, len(pending) - spent))
+        return total
+
+    def update(self) -> int:
+        """Свежий срез: перечитывает top-pools. Дёшево — 5 запросов на 100 пулов."""
+        return self.discover()

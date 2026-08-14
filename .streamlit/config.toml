@@ -1,0 +1,17 @@
+[server]
+headless = true
+# Загружать пользовательские файлы приложение не умеет — режем лимит,
+# чтобы не держать лишнюю память на бесплатном тарифе.
+maxUploadSize = 5
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+primaryColor = "#2E86DE"
+
+[client]
+# Пользователю публичного приложения трассировка Python ни о чём не говорит,
+# а вот внутренние пути раскрывает.
+showErrorDetails = false

@@ -1,0 +1,26 @@
+# Полный запуск на своём сервере: два процесса, общий том с базой.
+#   docker compose up -d
+#   docker compose logs -f collector
+
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      - arb-data:/data
+    environment:
+      TZ: Europe/Moscow
+
+  collector:
+    build: .
+    restart: unless-stopped
+    command: python -m history.collector --days 7 --timeframe 1m --pools 100
+    volumes:
+      - arb-data:/data
+    environment:
+      TZ: Europe/Moscow
+
+volumes:
+  arb-data:

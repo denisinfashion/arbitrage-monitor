@@ -1,0 +1,60 @@
+name: Сбор котировок
+
+# Каждые 15 минут. GitHub может задержать или пропустить запуск под нагрузкой —
+# это нормально, следующий прогон доберёт пропущенное.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:        # кнопка ручного запуска на вкладке Actions
+
+# Один прогон за раз: два параллельных перезапишут снимок друг друга.
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+permissions:
+  contents: write           # нужно для публикации снимка в Release
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Установка зависимостей
+        run: pip install -r requirements.txt
+
+      - name: Скачать накопленный снимок
+        continue-on-error: true    # первого запуска ещё нет — это не ошибка
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data
+          gh release download data --pattern '*.parquet' --dir data --clobber \
+            && echo "снимок скачан" || echo "снимка ещё нет, начинаем с нуля"
+          ls -la data/ || true
+
+      - name: Цикл сбора
+        env:
+          # Раннеры GitHub в США: Binance и Bybit отдают 451.
+          # Список бирж переопределяется здесь без правки кода.
+          ARB_CEX_VENUES: "okx,gate,mexc,kucoin"
+        run: |
+          python cloud_collect.py --minutes 8 --days 7 --timeframe 1m --pools 100
+
+      - name: Опубликовать снимок
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view data >/dev/null 2>&1 \
+            || gh release create data --title "Накопленные котировки" \
+                 --notes "Снимок обновляется автоматически каждые 15 минут." --latest=false
+          gh release upload data data/history.parquet data/pools.parquet --clobber
+          echo "Снимок опубликован" >> $GITHUB_STEP_SUMMARY

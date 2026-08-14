@@ -1,0 +1,22 @@
+# данные и журналы сборщика
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.parquet
+*.log
+
+# секреты Streamlit — в репозиторий не попадают, задаются в панели облака
+.streamlit/secrets.toml
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ос
+.DS_Store
+Thumbs.db
