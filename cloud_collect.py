@@ -90,6 +90,35 @@ def run_bounded(label: str, fn, seconds: float, default=0):
     return box.get("value", default)
 
 
+def _run_alerts() -> None:
+    """Ищет связки по свежим данным и шлёт оповещения, если настроено."""
+    from history import alerts
+
+    if not alerts.configured():
+        return
+
+    import time as _t
+    from history.paths import find_cycles
+    from history.rates import build_grid
+
+    window_h = float(os.environ.get("ALERT_WINDOW_HOURS", "6"))
+    quotes = store.read_quotes(since_ts=int(_t.time() - window_h * 3600),
+                               venue_kinds=["dex"])
+    if quotes.empty:
+        log.info("оповещения: нет свежих данных DEX")
+        return
+
+    s = SETTINGS
+    s.analysis_timeframe = os.environ.get("ALERT_TIMEFRAME", "15m")
+    s.staleness_sec = int(os.environ.get("ALERT_STALENESS", "1200"))
+
+    grid = build_grid(quotes, settings=s, venue_kinds=["dex"], max_assets=40)
+    _, cycles = find_cycles(grid, anchor=s.quote_asset, max_legs=s.max_legs,
+                            top=40, min_margin_pct=-100, settings=s)
+    n = alerts.notify(cycles)
+    log.info("оповещений отправлено: %d", n)
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Один цикл сбора для CI")
     p.add_argument("--minutes", type=float, default=8.0,
@@ -205,6 +234,15 @@ def main(argv=None) -> int:
 
     # Если после бирж время осталось — доберём ещё пулов.
     collect_dex(deadline)
+
+    # --- 2б. Оповещения ---------------------------------------------------
+    # Считаем связки по свежим данным и сообщаем о тех, что прибыльны
+    # прямо сейчас. Шаг необязательный: без настроенного бота он молча
+    # пропускается, а любая его ошибка не должна мешать выгрузке снимка.
+    try:
+        _run_alerts()
+    except Exception as exc:
+        log.error("оповещения: %s", exc)
 
     # --- 3. Обрезаем и выгружаем -----------------------------------------
     cutoff = int(time.time() - SETTINGS.history_days * 86400)

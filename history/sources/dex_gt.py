@@ -184,16 +184,18 @@ class GeckoTerminalSource:
         if not address:
             return None
 
-        def tok(side: str) -> Tuple[str, str]:
+        def tok(side: str) -> Tuple[str, str, str]:
             ref = ((rel.get(side) or {}).get("data") or {}).get("id", "")
             obj = tokens.get(ref) or {}
             a = obj.get("attributes", {}) or {}
             sym = (a.get("symbol") or "").upper()
             addr = a.get("address") or (ref.split("_", 1)[-1] if "_" in ref else "")
-            return sym, addr
+            # Полное имя нужно для расшифровки тикеров в интерфейсе:
+            # по «BTCB» не всякий сходу поймёт, что это Bitcoin в сети BNB.
+            return sym, addr, (a.get("name") or "").strip()
 
-        base_sym, base_addr = tok("base_token")
-        quote_sym, quote_addr = tok("quote_token")
+        base_sym, base_addr, base_name = tok("base_token")
+        quote_sym, quote_addr, quote_name = tok("quote_token")
         if not base_sym or not quote_sym:
             base_sym, quote_sym = _parse_pool_name(attrs.get("name", ""))
         if not base_sym or not quote_sym:
@@ -209,6 +211,8 @@ class GeckoTerminalSource:
             "quote": norm_asset(quote_sym),
             "base_addr": base_addr,
             "quote_addr": quote_addr,
+            "base_name": base_name,
+            "quote_name": quote_name,
             "reserve_usd": _f(attrs.get("reserve_in_usd")),
             "volume_24h": _f((attrs.get("volume_usd") or {}).get("h24")),
             "fee_pct": DEX_POOL_FEE_PCT.get(dex_id, DEX_POOL_FEE_PCT["default"]),

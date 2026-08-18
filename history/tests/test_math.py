@@ -143,7 +143,7 @@ def test_no_false_positive():
 
     tbl, cycles = find_cycles(grid, anchor="USDT", max_legs=4, top=10,
                               gas_per_dex_leg_usd=0.0, settings=s)
-    check("поиск не выдаёт прибыльных связок", tbl.empty or (tbl["Маржа макс, %"] <= 0).all(),
+    check("поиск не выдаёт прибыльных связок", tbl.empty or (tbl["Макс %"] <= 0).all(),
           f"строк: {len(tbl)}")
 
 
@@ -163,7 +163,7 @@ def test_search_finds_it():
         return
 
     best = tbl.iloc[0]["Связка"]
-    print(f"      лучшая связка: {best}  ({tbl.iloc[0]['Маржа медиана, %']}%)")
+    print(f"      лучшая связка: {best}  ({tbl.iloc[0]['Медиана %']}%)")
     check("найден правильный цикл",
           best in ("USDT → BNB → CAKE → USDT",),
           best)
@@ -279,7 +279,7 @@ def test_four_leg_reconstruction():
     if tbl.empty:
         return
     best = tbl.iloc[0]["Связка"]
-    print(f"      лучшая связка: {best}  ({tbl.iloc[0]['Маржа медиана, %']}%)")
+    print(f"      лучшая связка: {best}  ({tbl.iloc[0]['Медиана %']}%)")
     check("восстановлен верный маршрут из четырёх ног",
           best == "USDT → A → B → C → USDT", best)
     check("длина маршрута = 4 ноги", int(tbl.iloc[0]["Ног"]) == 4)
@@ -288,7 +288,7 @@ def test_four_leg_reconstruction():
     tbl3, _ = find_cycles(grid, anchor="USDT", max_legs=3, top=10,
                           gas_per_dex_leg_usd=0.0, settings=s)
     check("при max_legs=3 прибыльных связок нет",
-          tbl3.empty or (tbl3["Маржа макс, %"] <= 0).all(), f"строк: {len(tbl3)}")
+          tbl3.empty or (tbl3["Макс %"] <= 0).all(), f"строк: {len(tbl3)}")
 
 
 def test_reconstruction_uses_correct_timestep():
@@ -485,6 +485,91 @@ def test_leveraged_excluded_from_grid():
     check("по умолчанию фильтр включён", Settings().spot_only is True)
 
 
+def test_route_order_and_links():
+    print("\n13. Порядок площадок и ссылки на обмен")
+
+    from ..links import chain_name, swap_url, token_name
+    from ..store import init as store_init, write_pools
+
+    # Имена площадок подобраны так, чтобы алфавитный порядок НЕ совпадал
+    # с порядком исполнения: по алфавиту alpha, mike, zebra, а исполнять
+    # надо zebra -> alpha -> mike. Если колонка когда-нибудь начнёт
+    # сортировать площадки, тест это поймает.
+    t0 = 1_700_000_000
+    rows = []
+    for k in range(20):
+        ts = t0 + k * 60
+        for venue, base, quote, price in [
+            ("zebra", "A", "USDT", 1.00), ("alpha", "A", "USDT", 1.50),
+            ("alpha", "B", "A", 1.00), ("mike", "B", "A", 1.50),
+            ("mike", "B", "USDT", 1.30), ("zebra", "B", "USDT", 0.90),
+        ]:
+            rows.append(dict(ts=ts, venue=venue, venue_kind="dex", chain="bsc",
+                             base=base, quote=quote, close=price,
+                             volume=1e9, liquidity_usd=3e6, pool=f"0x{venue}"))
+
+    s = Settings()
+    s.timeframe = "1m"
+    grid = build_grid(pd.DataFrame(rows), settings=s, apply_slippage=False)
+    idx = [grid.asset_index(a) for a in ("USDT", "A", "B", "USDT")]
+    cyc = evaluate_path(grid, idx)
+
+    check("реестр площадок отсортирован по алфавиту",
+          grid.venues == sorted(grid.venues), str(grid.venues))
+    check("колонка идёт по порядку ИСПОЛНЕНИЯ, а не по алфавиту",
+          cyc.dominant_venues() == ["zebra", "alpha", "mike"],
+          " → ".join(cyc.dominant_venues()))
+
+    st = cyc.stats()
+    check("маршрут пронумерован по ногам",
+          st["Маршрут"] == "1·zebra → 2·alpha → 3·mike", st["Маршрут"])
+
+    # сеть и ликвидность
+    check("сеть определена", st["Сеть"] == "BNB Chain", st["Сеть"])
+    check("переводы не нужны: всё в одной сети на DEX", st["Переводы"] == "нет")
+    check("узкое место по ликвидности найдено",
+          cyc.bottleneck_liquidity() == 3e6, str(cyc.bottleneck_liquidity()))
+
+    legs = cyc.leg_links()
+    check("данные по каждой ноге", len(legs) == 3, str(len(legs)))
+    check("ноги пронумерованы по порядку", [l["n"] for l in legs] == [1, 2, 3])
+    check("направление обмена верное",
+          [(l["from"], l["to"]) for l in legs] == [("USDT", "A"), ("A", "B"), ("B", "USDT")])
+
+    # ссылки строятся, когда известны адреса контрактов
+    url = swap_url("pancakeswap_v3", "bsc", "0xAAA", "0xBBB")
+    check("ссылка на PancakeSwap собирается",
+          url and "pancakeswap.finance/swap" in url and "0xAAA" in url and "0xBBB" in url,
+          (url or "")[:80])
+    check("сеть подставлена в ссылку", "chain=bsc" in (url or ""))
+
+    url2 = swap_url("неизвестная_биржа", "bsc", "0xAAA", "0xBBB")
+    check("для незнакомой площадки даётся агрегатор",
+          url2 and "1inch" in url2 and "/56/" in url2, (url2 or "")[:70])
+
+    check("без адресов ссылки нет", swap_url("pancakeswap", "bsc", "", "") is None)
+    check("название сети человекочитаемо", chain_name("bsc") == "BNB Chain")
+
+
+def test_token_names():
+    print("\n14. Расшифровка тикеров")
+
+    from ..links import describe_path, token_name
+
+    check("встроенный справочник", token_name("CAKE") == "PancakeSwap")
+    check("обёртка распознана", token_name("BTCB") == "Bitcoin BEP-20")
+    check("имя из данных о пулах, если своего нет",
+          token_name("ZZZ", {"ZZZ": "Zed Token"}) == "Zed Token")
+    check("встроенное имя приоритетнее",
+          token_name("CAKE", {"CAKE": "мусор"}) == "PancakeSwap")
+    check("неизвестный тикер даёт пусто", token_name("QQQQ") == "")
+
+    note = describe_path(("USDT", "CAKE", "BTCB", "USDT"))
+    check("стартовый актив не повторяется в расшифровке", "USDT" not in note, note)
+    check("промежуточные расшифрованы",
+          "CAKE — PancakeSwap" in note and "BTCB — Bitcoin BEP-20" in note, note)
+
+
 def main() -> int:
     print("=" * 70)
     print("Проверка математики исторического сканнера")
@@ -501,6 +586,8 @@ def main() -> int:
     test_scale()
     test_leveraged_filter()
     test_leveraged_excluded_from_grid()
+    test_route_order_and_links()
+    test_token_names()
 
     print("\n" + "=" * 70)
     if FAILED:

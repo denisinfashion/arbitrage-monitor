@@ -85,6 +85,14 @@ with st.sidebar:
                                "цена следует за NAV, а не за базовым активом, "
                                "и разница между площадками неисполнима.")
 
+    one_chain = st.toggle("Только без переводов", value=True,
+                          help="Оставить связки, где все обмены идут в одной "
+                               "сети на DEX — это последовательность свопов "
+                               "из кошелька. Как только появляется биржа или "
+                               "вторая сеть, между ногами нужен перевод: "
+                               "комиссия сети, время, иногда заморозка вывода. "
+                               "Расчёт этого не учитывает.")
+
     apply_slip = st.toggle("Учитывать проскальзывание", value=True,
                            help="Для DEX — точная формула по резерву пула. "
                                 "Для CEX — оценка по обороту свечи.")
@@ -107,16 +115,24 @@ with st.sidebar:
 
     sort_by = st.selectbox(
         "Сортировать по",
-        ["окна", "максимум", "медиана", "сейчас"],
+        ["окна", "максимум", "медиана", "сейчас", "ликвидность"],
         format_func={
             "окна": "доле прибыльного времени",
             "максимум": "лучшей марже за период",
             "медиана": "типичной марже",
             "сейчас": "марже в последней точке",
+            "ликвидность": "ликвидности пулов",
         }.get,
         help="«Доля прибыльного времени» — практичный выбор: связка с редкими, "
              "но реальными окнами полезнее той, что стабильно чуть ниже нуля.",
     )
+
+    st.divider()
+    detailed = st.toggle("Показать все колонки", value=False,
+                         help="По умолчанию в таблице только то, по чему "
+                              "принимается решение. Остальное — сеть, окна, "
+                              "расшифровка тикеров — прячется, чтобы таблица "
+                              "влезала в экран без прокрутки вбок.")
 
     run = st.button("Найти связки", type="primary", **FULL)
 
@@ -130,7 +146,7 @@ with st.sidebar:
 def compute(window_h: float, anchor: str, max_legs: int, trade_size: float,
             kinds: tuple, apply_slip: bool, staleness: int, gas_leg: float,
             max_assets: int, top_n: int, min_margin: float, sort_by: str,
-            spot_only: bool, granularity: str, _bust: int):
+            spot_only: bool, granularity: str, one_chain: bool, _bust: int):
     since = int(time.time() - window_h * 3600)
     quotes = snapshot.read_quotes(since_ts=since, venue_kinds=list(kinds))
     if quotes.empty:
@@ -148,6 +164,12 @@ def compute(window_h: float, anchor: str, max_legs: int, trade_size: float,
                                     top=top_n, gas_per_dex_leg_usd=gas_leg,
                                     min_margin_pct=min_margin,
                                     sort_by=sort_by, settings=s)
+        if one_chain and cycles:
+            keep = [i for i, c in enumerate(cycles) if not c.needs_transfer()]
+            if keep:
+                names = {cycles[i].label for i in keep}
+                table = table[table["Связка"].isin(names)].reset_index(drop=True)
+                cycles = [cycles[i] for i in keep]
     except MemoryError as exc:
         return None, None, None, (
             f"{exc} Уменьшите окно анализа или число активов в боковой панели."
@@ -168,7 +190,7 @@ with st.spinner("Строю сетку курсов и ищу связки…"):
     grid, table, cycles, err = compute(
         window_h, anchor, max_legs, trade_size, tuple(kinds), apply_slip,
         staleness, gas_leg, max_assets, top_n, min_margin, sort_by, spot_only,
-        granularity, st.session_state.bust_paths,
+        granularity, one_chain, st.session_state.bust_paths,
     )
 
 if err:
@@ -212,38 +234,79 @@ SORT_LABEL = {
     "максимум": "лучшей марже за период",
     "медиана": "типичной марже",
     "сейчас": "марже в последней точке",
+    "ликвидность": "ликвидности пулов",
 }
 st.subheader(f"Связки, отсортированные по {SORT_LABEL.get(sort_by, sort_by)}")
 st.caption(
-    f"Окно {window_h:.0f} ч · объём ${trade_size:,.0f} · "
-    f"газ ${gas_leg:.2f} за своп · допустимый возраст котировки {staleness} с"
-    + f" · шаг {granularity}"
-    + (" · только спот" if spot_only else " · включая токены с плечом")
+    f"Окно {window_h:.0f} ч · шаг {granularity} · объём ${trade_size:,.0f} · "
+    f"газ ${gas_leg:.2f} за своп · возраст котировки до {staleness} с"
     .replace(",", " ")
+    + (" · только спот" if spot_only else " · с плечевыми токенами")
+    + (" · без переводов" if one_chain else "")
 )
 
-display = table.drop(columns=["Точек", "Площадок разных"], errors="ignore")
+display = table.drop(columns=["Точек"], errors="ignore")
 
+# Короткий набор: только то, по чему принимается решение. Прочее — по кнопке.
+BRIEF = ["Связка", "Ног", "Сейчас %", "Макс %", "В плюсе %",
+         "Окно средн, мин", "Ликвидность $", "Маршрут"]
+if not detailed:
+    display = display[[c for c in BRIEF if c in display.columns]]
+
+# Заголовки намеренно короткие. Ширина колонки в таблице тянется по самому
+# длинному содержимому, а заголовок обычно длиннее значения: «Доля
+# прибыльного времени, %» против «9.7». На узком экране из-за одних только
+# подписей приходилось мотать таблицу вбок. Расшифровки убраны в подсказки.
+COLS = {
+    "Связка":         st.column_config.TextColumn("Связка", width="medium",
+                        help="Цепочка обменов от стартового актива и обратно"),
+    "Ног":            st.column_config.NumberColumn("Ног", width="small", format="%d"),
+    "Сейчас %":       st.column_config.NumberColumn("Сейчас", width="small",
+                        format="%+.3f", help="Маржа в последней точке истории"),
+    "Макс %":         st.column_config.NumberColumn("Макс", width="small",
+                        format="%+.3f", help="Лучшая маржа за выбранное окно"),
+    "Медиана %":      st.column_config.NumberColumn("Медиана", width="small",
+                        format="%+.3f", help="Типичная маржа за окно"),
+    "В плюсе %":      st.column_config.NumberColumn("В плюсе", width="small",
+                        format="%.1f%%", help="Какую долю времени связка была прибыльна"),
+    "Окон":           st.column_config.NumberColumn("Окон", width="small", format="%d",
+                        help="Сколько раз возникала возможность"),
+    "Окно макс, мин": st.column_config.NumberColumn("Окно макс", width="small",
+                        format="%d м",
+                        help="Самое длинное окно возможности, минут"),
+    "Окно средн, мин": st.column_config.NumberColumn("Окно средн", width="small",
+                        format="%d м",
+                        help="Типичная длительность окна — столько есть на то, "
+                             "чтобы зайти и провернуть обмен"),
+    "Ликвидность $":  st.column_config.NumberColumn("Ликвидн.", width="small",
+                        format="compact",
+                        help="Самый мелкий пул в цепочке — он и ограничивает объём"),
+    "Сеть":           st.column_config.TextColumn("Сеть", width="small"),
+    "Переводы":       st.column_config.TextColumn("Перев.", width="small",
+                        help="Нужен ли вывод между площадками. «нет» — все обмены "
+                             "в одной сети из кошелька"),
+    "Маршрут":        st.column_config.TextColumn("Маршрут", width="medium",
+                        help="Площадки по порядку исполнения обмена"),
+    "Данные %":       st.column_config.NumberColumn("Данн.", width="small",
+                        format="%.0f%%", help="Покрытие окна данными"),
+    "Токены":         st.column_config.TextColumn("Токены", width="medium",
+                        help="Расшифровка тикеров маршрута"),
+}
 # Градиент вешаем на максимум маржи, а не на медиану: медиана почти всегда
 # отрицательна, и зелёный на отрицательных числах читается как «хорошо».
-# Центрируем шкалу на нуле, чтобы цвет означал знак, а не место в выборке.
-_mx = display["Маржа макс, %"].abs().max() or 1.0
+# Шкала центрирована на нуле, чтобы цвет означал знак.
+_mx = float(display["Макс %"].abs().max() or 1.0)
 st.dataframe(
-    display.style
-        .background_gradient(subset=["Маржа макс, %"], cmap="RdYlGn",
-                             vmin=-_mx, vmax=_mx)
-        .format({"Маржа сейчас, %": "{:+.4f}", "Маржа макс, %": "{:+.4f}",
-                 "Маржа медиана, %": "{:+.4f}",
-                 "Доля прибыльного времени, %": "{:.2f}",
-                 "Покрытие данными, %": "{:.1f}"}, na_rep="—"),
-    **FULL, hide_index=True, height=420,
+    display.style.background_gradient(subset=["Макс %"], cmap="RdYlGn",
+                                      vmin=-_mx, vmax=_mx),
+    **FULL, hide_index=True, height=420, column_config=COLS,
 )
 
-if (display["Маржа сейчас, %"].fillna(-1) <= 0).all():
+if (display["Сейчас %"].fillna(-1) <= 0).all():
     st.caption(
         "Ни одна связка не прибыльна прямо сейчас — обычная ситуация. "
-        "Колонка «Маржа макс» показывает, что было в лучший момент окна, "
-        "«Доля прибыльного времени» — насколько такие моменты часты."
+        "«Макс» показывает лучший момент окна, «В плюсе» — насколько такие "
+        "моменты часты, «Окно средн» — сколько времени обычно есть на сделку."
     )
 
 st.download_button("Скачать таблицу CSV",
@@ -265,16 +328,47 @@ leg_cols = [c for c in df.columns if c.startswith("Нога ")]
 
 g1, g2 = st.columns([3, 1])
 with g2:
-    st.markdown("**Ноги и площадки**")
-    for i, (a, b) in enumerate(zip(cyc.assets[:-1], cyc.assets[1:])):
-        st.markdown(f"{i + 1}. `{a} → {b}` — **{cyc.dominant_venues()[i]}**")
+    st.markdown("**Обмены по порядку**")
+    legs = cyc.leg_links()
+    for leg in legs:
+        head = f"{leg['n']}. `{leg['from']} → {leg['to']}`"
+        st.markdown(head)
+        bits = [f"**{leg['venue']}**"]
+        if leg["chain_name"] != "—":
+            bits.append(leg["chain_name"])
+        if leg["liquidity"]:
+            bits.append(f"пул ${leg['liquidity']:,.0f}".replace(",", " "))
+        st.caption(" · ".join(bits))
+        # Ссылка ведёт на страницу обмена с уже подставленными адресами
+        # контрактов — её можно открыть во встроенном браузере кошелька.
+        links = []
+        if leg["swap"]:
+            links.append(f"[открыть обмен]({leg['swap']})")
+        if leg["pool_page"]:
+            links.append(f"[пул]({leg['pool_page']})")
+        if links:
+            st.markdown(" · ".join(links))
+        # Показываем расшифровку, только если она что-то добавляет:
+        # строка «BNB — BNB» занимает место и не сообщает ничего.
+        if leg["name_to"] and leg["name_to"].upper() != leg["to"].upper():
+            st.caption(f"{leg['to']} — {leg['name_to']}")
+
+    if cyc.needs_transfer():
+        st.warning(
+            "Связка требует переводов между площадками или сетями. "
+            "Комиссия вывода, время перевода и движение цены за это время "
+            "в расчёт не входят.", icon="⚠️")
+
     st.markdown("---")
     m = cyc.margin_pct()
     ok = np.isfinite(m)
     if ok.any():
-        st.metric("Маржа медиана", f"{np.median(m[ok]):.4f} %")
-        st.metric("Маржа максимум", f"{m[ok].max():.4f} %")
+        st.metric("Маржа медиана", f"{np.median(m[ok]):.3f} %")
+        st.metric("Маржа максимум", f"{m[ok].max():.3f} %")
         st.metric("Время в плюсе", f"{(m[ok] > 0).mean() * 100:.1f} %")
+    bl = cyc.bottleneck_liquidity()
+    if bl:
+        st.metric("Узкое место по ликвидности", f"${bl:,.0f}".replace(",", " "))
     st.caption(f"Газ учтён: ${cyc.gas_usd:.2f}")
 
 with g1:

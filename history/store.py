@@ -60,6 +60,8 @@ CREATE TABLE IF NOT EXISTS pools (
     quote         TEXT,
     base_addr     TEXT,
     quote_addr    TEXT,
+    base_name     TEXT,
+    quote_name    TEXT,
     reserve_usd   REAL,
     volume_24h    REAL,
     fee_pct       REAL,
@@ -121,11 +123,40 @@ def connect(read_only: bool = False) -> sqlite3.Connection:
     return conn
 
 
+# Колонки, добавленные после первого выпуска. У кого база уже создана,
+# CREATE TABLE IF NOT EXISTS её не тронет — нужен отдельный ALTER.
+MIGRATIONS = [
+    ("pools", "base_name", "TEXT"),
+    ("pools", "quote_name", "TEXT"),
+]
+
+
 def init() -> None:
-    """Создаёт схему. Вызывать один раз при старте сборщика."""
+    """Создаёт схему и досоздаёт недостающие колонки."""
     conn = connect()
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.commit()
+
+
+def _migrate(conn) -> None:
+    """Мягкое обновление схемы: добавляет колонки, которых ещё нет.
+
+    Нужно, потому что база переживает обновления кода — и локально,
+    и в облаке, где она каждый раз разворачивается из снимка. Без этого
+    старая база молча теряла бы новые поля.
+    """
+    for table, column, ctype in MIGRATIONS:
+        try:
+            have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        except Exception:
+            continue
+        if have and column not in have:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ctype}")
+                log.info("схема: добавлена колонка %s.%s", table, column)
+            except Exception as exc:
+                log.debug("не удалось добавить %s.%s: %s", table, column, exc)
 
 
 @contextmanager
@@ -195,12 +226,16 @@ def write_candles(candles: Sequence[Candle]) -> int:
 def write_pools(rows: Iterable[dict]) -> int:
     sql = """
     INSERT INTO pools (chain, pool, dex, base, quote, base_addr, quote_addr,
+                       base_name, quote_name,
                        reserve_usd, volume_24h, fee_pct, updated_at)
     VALUES (:chain,:pool,:dex,:base,:quote,:base_addr,:quote_addr,
+            :base_name,:quote_name,
             :reserve_usd,:volume_24h,:fee_pct,:updated_at)
     ON CONFLICT (chain, pool) DO UPDATE SET
         dex=excluded.dex, base=excluded.base, quote=excluded.quote,
         base_addr=excluded.base_addr, quote_addr=excluded.quote_addr,
+        base_name=COALESCE(excluded.base_name, pools.base_name),
+        quote_name=COALESCE(excluded.quote_name, pools.quote_name),
         reserve_usd=excluded.reserve_usd, volume_24h=excluded.volume_24h,
         fee_pct=excluded.fee_pct, updated_at=excluded.updated_at
     """
@@ -211,6 +246,7 @@ def write_pools(rows: Iterable[dict]) -> int:
     for r in rows:
         r.setdefault("updated_at", now)
         for k in ("dex", "base", "quote", "base_addr", "quote_addr",
+                  "base_name", "quote_name",
                   "reserve_usd", "volume_24h", "fee_pct"):
             r.setdefault(k, None)
     with transaction() as conn:

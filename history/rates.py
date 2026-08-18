@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -54,6 +54,27 @@ class RateGrid:
     log_rate: np.ndarray       # (T, N, N) float32
     venue_idx: np.ndarray      # (T, N, N) int16, -1 если курса нет
     trade_size_usd: float
+
+    # Справочники о площадках и парах. Хранятся отдельными словарями,
+    # а не ещё одним трёхмерным массивом: значения почти не меняются
+    # во времени, а память на бесплатном тарифе на счету.
+    venue_chain: Dict[str, str] = field(default_factory=dict)
+    """площадка -> сеть ('bsc'), пусто для бирж"""
+
+    venue_kind: Dict[str, str] = field(default_factory=dict)
+    """площадка -> 'cex' или 'dex'"""
+
+    pair_liquidity: Dict[Tuple[str, str, str], float] = field(default_factory=dict)
+    """(площадка, актив, актив) -> типичная ликвидность пула в долларах"""
+
+    pair_pool: Dict[Tuple[str, str, str], str] = field(default_factory=dict)
+    """(площадка, актив, актив) -> адрес пула"""
+
+    token_address: Dict[Tuple[str, str], str] = field(default_factory=dict)
+    """(сеть, тикер) -> адрес контракта"""
+
+    token_name: Dict[str, str] = field(default_factory=dict)
+    """тикер -> полное имя токена"""
 
     @property
     def n_assets(self) -> int:
@@ -280,8 +301,60 @@ def build_grid(
     log_rate[:, diag, diag] = 0.0
     venue_idx[:, diag, diag] = -1
 
+    meta = _collect_meta(df, settings)
     return RateGrid(times=times, assets=asset_list, venues=venue_list,
-                    log_rate=log_rate, venue_idx=venue_idx, trade_size_usd=trade)
+                    log_rate=log_rate, venue_idx=venue_idx, trade_size_usd=trade,
+                    **meta)
+
+
+def _collect_meta(df: pd.DataFrame, settings) -> dict:
+    """Собирает справочники: сети площадок, ликвидность пар, адреса токенов.
+
+    Всё это нужно интерфейсу, чтобы показать, в какой сети идёт обмен,
+    сколько в пуле денег и куда вести ссылку на своп. В самой математике
+    не участвует.
+    """
+    venue_chain, venue_kind = {}, {}
+    for v, grp in df.groupby("venue", sort=False):
+        venue_kind[v] = str(grp["venue_kind"].iloc[0])
+        chains = [c for c in grp["chain"].unique() if c]
+        venue_chain[v] = str(chains[0]) if chains else ""
+
+    pair_liquidity, pair_pool = {}, {}
+    if "liquidity_usd" in df.columns:
+        liq = df.dropna(subset=["liquidity_usd"])
+        if not liq.empty:
+            for (v, b, q), grp in liq.groupby(["venue", "base", "quote"], sort=False):
+                val = float(grp["liquidity_usd"].median())
+                # пара симметрична: ликвидность одна и та же в обе стороны
+                pair_liquidity[(v, b, q)] = val
+                pair_liquidity[(v, q, b)] = val
+                pools = grp["pool"].dropna()
+                if not pools.empty:
+                    pair_pool[(v, b, q)] = str(pools.iloc[0])
+                    pair_pool[(v, q, b)] = str(pools.iloc[0])
+
+    # Адреса и имена токенов лежат в справочнике пулов, а не в котировках
+    token_address, token_name = {}, {}
+    try:
+        from . import store
+        conn = store.connect(read_only=True)
+        rows = conn.execute(
+            "SELECT chain, base, quote, base_addr, quote_addr, "
+            "base_name, quote_name FROM pools").fetchall()
+        for r in rows:
+            for sym, addr, name in ((r["base"], r["base_addr"], r["base_name"]),
+                                    (r["quote"], r["quote_addr"], r["quote_name"])):
+                if sym and addr:
+                    token_address.setdefault((r["chain"], sym), addr)
+                if sym and name:
+                    token_name.setdefault(sym, name)
+    except Exception as exc:
+        log.debug("справочник токенов недоступен: %s", exc)
+
+    return {"venue_chain": venue_chain, "venue_kind": venue_kind,
+            "pair_liquidity": pair_liquidity, "pair_pool": pair_pool,
+            "token_address": token_address, "token_name": token_name}
 
 
 def _scatter_max(log_rate, venue_idx, ti, bi, qi, values, vi) -> None:

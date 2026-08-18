@@ -103,6 +103,83 @@ class Cycle:
             return ["—"] * self.legs
         return self.venue_names(int(np.nanargmax(m)))
 
+    # ---------------------------------------------------------------- сеть
+    def chains(self) -> List[str]:
+        """Сети, задействованные в связке, в порядке исполнения."""
+        return [self.grid.venue_chain.get(v, "") for v in self.dominant_venues()]
+
+    def single_chain(self) -> Optional[str]:
+        """Единственная сеть связки или None, если их несколько."""
+        uniq = {c for c in self.chains() if c}
+        kinds = {self.grid.venue_kind.get(v, "") for v in self.dominant_venues()}
+        if kinds == {"dex"} and len(uniq) == 1:
+            return uniq.pop()
+        return None
+
+    def needs_transfer(self) -> bool:
+        """Требует ли связка переводов между площадками или сетями.
+
+        Обмен внутри одной сети на DEX — это последовательность свопов
+        из одного кошелька: быстро и без вывода. Как только в цепочке
+        появляется биржа или вторая сеть, между ногами возникает перевод:
+        комиссия сети, время подтверждения, а иногда и заморозка вывода.
+        Расчёт этого не учитывает, поэтому такие связки надо помечать.
+        """
+        return self.single_chain() is None
+
+    # --------------------------------------------------------- ликвидность
+    def leg_liquidity(self) -> List[Optional[float]]:
+        """Ликвидность пула на каждой ноге, в долларах."""
+        out = []
+        for v, a, b in zip(self.dominant_venues(),
+                           self.assets[:-1], self.assets[1:]):
+            out.append(self.grid.pair_liquidity.get((v, a, b)))
+        return out
+
+    def bottleneck_liquidity(self) -> Optional[float]:
+        """Самая мелкая ликвидность в цепочке — она и ограничивает объём."""
+        vals = [x for x in self.leg_liquidity() if x]
+        return min(vals) if vals else None
+
+    # -------------------------------------------------------------- ссылки
+    def leg_links(self) -> List[dict]:
+        """Данные по каждой ноге для интерфейса: площадка, сеть, ссылки."""
+        from .links import chain_name, pool_url, swap_url, token_name
+
+        out = []
+        venues = self.dominant_venues()
+        liq = self.leg_liquidity()
+        for i, (v, a, b) in enumerate(zip(venues, self.assets[:-1], self.assets[1:])):
+            chain = self.grid.venue_chain.get(v, "")
+            addr_a = self.grid.token_address.get((chain, a), "")
+            addr_b = self.grid.token_address.get((chain, b), "")
+            pool = self.grid.pair_pool.get((v, a, b), "")
+            out.append({
+                "n": i + 1,
+                "from": a,
+                "to": b,
+                "venue": v,
+                "kind": self.grid.venue_kind.get(v, ""),
+                "chain": chain,
+                "chain_name": chain_name(chain) if chain else "—",
+                "liquidity": liq[i],
+                "swap": swap_url(v, chain, addr_a, addr_b) if chain else None,
+                "pool_page": pool_url(chain, pool) if chain and pool else None,
+                "name_from": token_name(a, self.grid.token_name),
+                "name_to": token_name(b, self.grid.token_name),
+            })
+        return out
+
+    def first_swap_url(self) -> Optional[str]:
+        """Ссылка на первый обмен — с него начинается исполнение."""
+        legs = self.leg_links()
+        return legs[0]["swap"] if legs else None
+
+    def token_note(self) -> str:
+        """Расшифровка тикеров маршрута."""
+        from .links import describe_path
+        return describe_path(self.assets, self.grid.token_name)
+
     def stats(self) -> dict:
         m = self.margin_pct()
         ok = np.isfinite(m)
@@ -112,18 +189,32 @@ class Cycle:
         positive = mv > 0
         last = mv[-1] if ok[-1] else np.nan
         venues = self.dominant_venues()
+        step = self.grid_step_min()
+        liq = self.bottleneck_liquidity()
+        chain = self.single_chain()
+
+        from .links import chain_name
+
+        # Площадки нумеруются по порядку исполнения обмена. Без номеров
+        # список читается как перечисление, хотя это последовательность.
+        route = " → ".join(f"{i + 1}·{v}" for i, v in enumerate(venues))
+
         return {
             "Связка": self.label,
             "Ног": self.legs,
-            "Маржа сейчас, %": round(float(last), 4) if last == last else None,
-            "Маржа макс, %": round(float(mv.max()), 4),
-            "Маржа медиана, %": round(float(np.median(mv)), 4),
-            "Доля прибыльного времени, %": round(float(positive.mean() * 100), 2),
-            "Окон в плюсе": int(_count_runs(positive)),
-            "Макс. длина окна, мин": int(_longest_run(positive) * self.grid_step_min()),
-            "Покрытие данными, %": round(float(ok.mean() * 100), 1),
-            "Площадки": " | ".join(venues),
-            "Площадок разных": len(set(venues) - {"—"}),
+            "Сейчас %": round(float(last), 3) if last == last else None,
+            "Макс %": round(float(mv.max()), 3),
+            "Медиана %": round(float(np.median(mv)), 3),
+            "В плюсе %": round(float(positive.mean() * 100), 1),
+            "Окон": int(_count_runs(positive)),
+            "Окно макс, мин": int(_longest_run(positive) * step),
+            "Окно средн, мин": int(round(_mean_run(positive) * step)),
+            "Ликвидность $": round(liq) if liq else None,
+            "Сеть": chain_name(chain) if chain else "несколько",
+            "Переводы": "нет" if chain else "да",
+            "Маршрут": route,
+            "Данные %": round(float(ok.mean() * 100), 0),
+            "Токены": self.token_note(),
             "Точек": int(ok.sum()),
         }
 
@@ -151,6 +242,19 @@ def _count_runs(mask: np.ndarray) -> int:
     if mask.size == 0:
         return 0
     return int(np.sum(mask[1:] & ~mask[:-1]) + (1 if mask[0] else 0))
+
+
+def _mean_run(mask: np.ndarray) -> float:
+    """Средняя длина непрерывного участка True — типичное окно возможности."""
+    runs, cur = [], 0
+    for v in mask:
+        if v:
+            cur += 1
+        elif cur:
+            runs.append(cur); cur = 0
+    if cur:
+        runs.append(cur)
+    return float(np.mean(runs)) if runs else 0.0
 
 
 def _longest_run(mask: np.ndarray) -> int:
@@ -408,16 +512,17 @@ def find_cycles(
         return pd.DataFrame(), cycles
 
     df = pd.DataFrame(rows)
-    df = df[df["Маржа макс, %"] > min_margin]
+    df = df[df["Макс %"] > min_margin]
     if df.empty:
         return df, cycles
 
     sort_keys = {
-        "окна": ["Доля прибыльного времени, %", "Маржа макс, %"],
-        "максимум": ["Маржа макс, %", "Доля прибыльного времени, %"],
-        "медиана": ["Маржа медиана, %", "Доля прибыльного времени, %"],
-        "сейчас": ["Маржа сейчас, %", "Маржа макс, %"],
-    }.get(sort_by, ["Доля прибыльного времени, %", "Маржа макс, %"])
+        "окна": ["В плюсе %", "Макс %"],
+        "максимум": ["Макс %", "В плюсе %"],
+        "медиана": ["Медиана %", "В плюсе %"],
+        "сейчас": ["Сейчас %", "Макс %"],
+        "ликвидность": ["Ликвидность $", "Макс %"],
+    }.get(sort_by, ["В плюсе %", "Макс %"])
 
     df = df.sort_values(sort_keys, ascending=False, na_position="last")
     df = df.head(top).reset_index(drop=True)

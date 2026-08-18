@@ -24,3 +24,5 @@ jobs:
         run: python -m history.tests.test_snapshot
       - name: Устойчивость к отказам бирж
         run: python -m history.tests.test_cex_resilience
+      - name: Оповещения
+        run: python -m history.tests.test_alerts
