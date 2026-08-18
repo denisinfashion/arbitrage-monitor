@@ -65,3 +65,15 @@ jobs:
                  --notes "Снимок обновляется автоматически каждые 15 минут." --latest=false
           gh release upload data data/history.parquet data/pools.parquet --clobber
           echo "Снимок опубликован" >> $GITHUB_STEP_SUMMARY
+
+      - name: Разбудить приложение
+        continue-on-error: true
+        run: |
+          # Бесплатный тариф Streamlit усыпляет приложение после 12 часов
+          # без посетителей. Сборщик и так просыпается каждые 15 минут —
+          # пусть заодно заходит на страницу, тогда простоя не набирается.
+          URL="https://arbitrage-monitor.streamlit.app/"
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -m 60 -L "$URL" || echo 000)
+          echo "$URL -> $code"
+          [ "$code" = "200" ] && echo "приложение отвечает" \
+            || echo "не ответило, но на сбор это не влияет"
