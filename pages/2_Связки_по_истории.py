@@ -66,11 +66,11 @@ with st.sidebar:
                                  help="Под этот объём считается проскальзывание")
 
     granularity = st.selectbox(
-        "Гранулярность анализа", ["1m", "5m", "15m", "1h"], index=2,
-        help="Шаг сетки времени. Биржи отдают минутные данные, а пулы DEX "
-             "на бесплатной инфраструктуре обновляются раз в несколько минут — "
-             "на мелком шаге строки DEX будут считаться протухшими и связки "
-             "через них не найдутся.")
+        "Гранулярность анализа", ["1m", "5m", "15m", "1h"], index=1,
+        help="Шаг сетки времени. Биржи отдают минутные данные, пулы DEX "
+             "снимаются раз в пять минут — на более мелком шаге строки DEX "
+             "будут считаться протухшими и связки через них не найдутся. "
+             "Пять минут соответствуют частоте сбора.")
 
     st.divider()
     kinds = st.multiselect("Типы площадок", ["dex", "cex"],
@@ -113,6 +113,19 @@ with st.sidebar:
     min_margin = st.number_input("Порог маржи, %", -5.0, 10.0, 0.0, step=0.05,
                                  help="Показывать связки, у которых максимум за период выше порога")
 
+    max_margin = st.number_input(
+        "Потолок правдоподобия, %", 0.5, 1000.0, 5.0, step=0.5,
+        help="Связки с маржой выше потолка скрываются. Такая маржа означает "
+             "не находку, а неверную цену: одноимённую подделку токена, "
+             "налог на перевод или пул, в котором никто не торгует. "
+             "Поднимите значение, если хотите посмотреть и на них.")
+
+    trust = st.toggle(
+        "Отсеивать недостоверные пулы", value=True,
+        help="Выкидывает пулы без оборота и разводит одинаковые тикеры, "
+             "за которыми стоят разные контракты. Именно на них берутся "
+             "трёхзначные проценты, которых не существует.")
+
     sort_by = st.selectbox(
         "Сортировать по",
         ["окна", "максимум", "медиана", "сейчас", "ликвидность"],
@@ -146,7 +159,8 @@ with st.sidebar:
 def compute(window_h: float, anchor: str, max_legs: int, trade_size: float,
             kinds: tuple, apply_slip: bool, staleness: int, gas_leg: float,
             max_assets: int, top_n: int, min_margin: float, sort_by: str,
-            spot_only: bool, granularity: str, one_chain: bool, _bust: int):
+            spot_only: bool, granularity: str, one_chain: bool,
+            max_margin: float, trust: bool, _bust: int):
     since = int(time.time() - window_h * 3600)
     quotes = snapshot.read_quotes(since_ts=since, venue_kinds=list(kinds))
     if quotes.empty:
@@ -159,10 +173,12 @@ def compute(window_h: float, anchor: str, max_legs: int, trade_size: float,
     try:
         grid = build_grid(quotes, settings=s, trade_size_usd=trade_size,
                           venue_kinds=list(kinds), max_assets=max_assets,
-                          apply_slippage=apply_slip, spot_only=spot_only)
+                          apply_slippage=apply_slip, spot_only=spot_only,
+                          drop_suspicious=trust)
         table, cycles = find_cycles(grid, anchor=anchor, max_legs=max_legs,
                                     top=top_n, gas_per_dex_leg_usd=gas_leg,
                                     min_margin_pct=min_margin,
+                                    max_margin_pct=max_margin,
                                     sort_by=sort_by, settings=s)
         if one_chain and cycles:
             keep = [i for i, c in enumerate(cycles) if not c.needs_transfer()]
@@ -190,7 +206,7 @@ with st.spinner("Строю сетку курсов и ищу связки…"):
     grid, table, cycles, err = compute(
         window_h, anchor, max_legs, trade_size, tuple(kinds), apply_slip,
         staleness, gas_leg, max_assets, top_n, min_margin, sort_by, spot_only,
-        granularity, one_chain, st.session_state.bust_paths,
+        granularity, one_chain, max_margin, trust, st.session_state.bust_paths,
     )
 
 if err:
@@ -216,6 +232,22 @@ if cov < 0.02:
         "друг к другу, мало — большинство связок не замыкается. Соберите больше "
         "данных или добавьте биржи к DEX."
     )
+
+# Что отсеяно и почему. Показывается до проверки на пустую таблицу:
+# молчаливый фильтр хуже отсутствующего, а «ничего не найдено» без
+# объяснения читается как поломка данных.
+notes = getattr(grid, "quality_notes", None) or {}
+if notes:
+    with st.expander(f"Отсеяно как недостоверное — тикеров: {len(notes)}"):
+        st.caption(
+            "Пулы без оборота и тикеры, за которыми стоят разные контракты. "
+            "Именно на них берутся трёхзначные проценты, которых не существует. "
+            "Отключить можно в боковой панели."
+        )
+        st.dataframe(
+            pd.DataFrame({"Тикер": list(notes), "Причина": list(notes.values())}),
+            hide_index=True, **FULL,
+        )
 
 if table is None or table.empty:
     st.info(
@@ -243,6 +275,7 @@ st.caption(
     .replace(",", " ")
     + (" · только спот" if spot_only else " · с плечевыми токенами")
     + (" · без переводов" if one_chain else "")
+    + (f" · потолок {max_margin:g}%" if max_margin else "")
 )
 
 display = table.drop(columns=["Точек"], errors="ignore")

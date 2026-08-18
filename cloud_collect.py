@@ -35,7 +35,7 @@ from history.snapshot import export_snapshot, import_snapshot
 
 log = logging.getLogger("cloud")
 
-CODE_VERSION = "2026-08-14.2"
+CODE_VERSION = "2026-08-18.1"
 # Отметка версии в логе. Нужна из-за реального случая: прогон в CI дважды
 # шёл на старом коде — сперва потому, что коммит не был отправлен на сервер,
 # затем потому, что вместо нового запуска был повтор прежнего (повтор берёт
@@ -109,8 +109,11 @@ def _run_alerts() -> None:
         return
 
     s = SETTINGS
-    s.analysis_timeframe = os.environ.get("ALERT_TIMEFRAME", "15m")
-    s.staleness_sec = int(os.environ.get("ALERT_STALENESS", "1200"))
+    # Шаг анализа соответствует частоте живых срезов DEX: снимаем раз
+    # в пять минут — на пятиминутной сетке каждая точка заполнена, а на
+    # минутной четыре из пяти были бы пустыми.
+    s.analysis_timeframe = os.environ.get("ALERT_TIMEFRAME", "5m")
+    s.staleness_sec = int(os.environ.get("ALERT_STALENESS", "900"))
 
     grid = build_grid(quotes, settings=s, venue_kinds=["dex"], max_assets=40)
     _, cycles = find_cycles(grid, anchor=s.quote_asset, max_legs=s.max_legs,
@@ -125,6 +128,8 @@ def main(argv=None) -> int:
                    help="сколько минут работать, прежде чем выгрузить снимок")
     p.add_argument("--days", type=float, help="глубина истории")
     p.add_argument("--pools", type=int, help="сколько пулов DEX наблюдать")
+    p.add_argument("--dex-every", type=int,
+                   help="как часто снимать живые цены пулов, секунд")
     p.add_argument("--timeframe", help="1m, 5m, 15m, 1h")
     p.add_argument("--no-cex", action="store_true")
     p.add_argument("--no-dex", action="store_true")
@@ -139,6 +144,20 @@ def main(argv=None) -> int:
         SETTINGS.dex_pool_limit = args.pools
     if args.timeframe:
         SETTINGS.timeframe = args.timeframe
+    if args.dex_every:
+        SETTINGS.dex_pull_seconds = args.dex_every
+
+    # Список наблюдения: тикеры, пулы которых добираются принудительно.
+    # Заводится переменной окружения, чтобы добавить интересующую связку
+    # можно было правкой одной строки в workflow, без выпуска кода.
+    env_watch = os.environ.get("ARB_WATCH_TOKENS", "").strip()
+    if env_watch:
+        SETTINGS.watch_tokens = [w.strip().upper()
+                                 for w in env_watch.split(",") if w.strip()]
+        log.info("список наблюдения: %s", ", ".join(SETTINGS.watch_tokens))
+    env_dex = os.environ.get("ARB_DEX_VENUES", "").strip()
+    if env_dex:
+        SETTINGS.dex_venues = [d.strip() for d in env_dex.split(",") if d.strip()]
 
     # Раннеры GitHub стоят в США: Binance и Bybit отвечают 451.
     # Оставляем только те биржи, которые оттуда доступны.
@@ -187,53 +206,86 @@ def main(argv=None) -> int:
             log.warning("CEX %s пропущена", src.name)
     log.info("бирж доступно: %d из %d", len(alive), len(c.cex))
 
-    # Порядок важен. На первом живом прогоне биржи съели почти всё время
-    # (одна только KuCoin отдала 1.9 млн свечей за три минуты), и на DEX
-    # осталось четырнадцать секунд — история пулов не собралась вовсе.
-    # Между тем DEX и есть цель: сеть BNB, обмен без переводов. Биржи же
-    # дотягиваются инкрементально за секунды на следующих прогонах.
-    # Поэтому DEX получает гарантированную половину времени первым.
-    dex_deadline = time.time() + (deadline - time.time()) * 0.5
+    # Биржи и DEX работают одновременно, и это главное отличие от прежней
+    # схемы. Раньше время делилось: сперва DEX, потом биржи. Но у этих двух
+    # источников разная природа. Биржа отдаёт историю пачками по тысяче
+    # свечей — ей нужен один заход, и прошлое она добирает целиком. У пулов
+    # DEX прошлого нет: бесплатный API исторические свечи почти всегда
+    # придерживает, и единственный надёжный источник — живой срез цен
+    # прямо сейчас. Значит, для DEX важна не длительность захода,
+    # а частота срезов.
+    #
+    # Поэтому биржи уходят в фоновый поток, а главный поток весь прогон
+    # снимает живые цены пулов по расписанию — раз в dex_pull_seconds.
+    pulse = max(30, int(SETTINGS.dex_pull_seconds))
 
-    def collect_dex(until_ts: float) -> int:
-        if not c.dex:
-            return 0
-        total = 0
-        while time.time() < until_ts - 20:
-            n = run_bounded("DEX backfill",
-                            lambda: c.dex.backfill(budget_requests=25),
-                            min(180.0, until_ts - time.time()), default=-1)
-            if n < 0:
-                break
-            total += n
-            log.info("DEX: +%d свечей (всего %d), осталось %.0f с",
-                     n, total, until_ts - time.time())
-            # Ноль свечей раньше трактовался как «история набрана», хотя это
-            # же значение возвращается и когда нас придержали по лимиту.
-            # Теперь источник сообщает об этом явно.
-            if n == 0:
-                if getattr(c.dex, "last_backfill_complete", False):
+    # Порядок бирж сдвигается от прогона к прогону. Причина конкретная:
+    # KuCoin отвечает раннерам медленнее прочих и, стоя последней, два
+    # прогона подряд упиралась в лимит времени и не отдавала ничего.
+    if alive:
+        shift = int(time.time() // 900) % len(alive)
+        alive = alive[shift:] + alive[:shift]
+        log.info("порядок бирж в этом прогоне: %s",
+                 ", ".join(s.name for s in alive))
+
+    def cex_worker() -> None:
+        for i, src in enumerate(alive):
+            if left() <= 30:
+                log.warning("время вышло, биржи собраны не полностью")
+                return
+            # Остаток делится между оставшимися, но не меньше минуты:
+            # фиксированные 180 с раньше означали, что первая биржа могла
+            # съесть всё, а последняя не получала ничего.
+            share = max(60.0, left() / max(1, len(alive) - i))
+            fn = src.update if before["rows"] else src.backfill
+            n = run_bounded(f"CEX {src.name} сбор", fn, min(share, left()))
+            log.info("CEX %s: +%d свечей", src.name, n)
+
+    cex_thread = None
+    if alive:
+        cex_thread = threading.Thread(target=cex_worker, daemon=True, name="cex")
+        cex_thread.start()
+
+    # Живые срезы DEX по расписанию. Первый уже сделан в discover выше,
+    # поэтому отсчёт идёт от него.
+    pulses = 1
+    next_pulse = time.time() + pulse
+    backfill_tried = False
+
+    while c.dex and time.time() < deadline - 10:
+        now = time.time()
+        if now >= next_pulse:
+            run_bounded("DEX срез", c.dex.discover, min(90.0, deadline - now))
+            pulses += 1
+            next_pulse = time.time() + pulse
+            continue
+
+        # Между срезами один раз пробуем дотянуть историю пулов. Чаще
+        # незачем: бесплатный лимит GeckoTerminal общий на весь адрес
+        # раннера, и повторные попытки в том же прогоне упираются в него же.
+        if not backfill_tried:
+            backfill_tried = True
+            budget = min(120.0, next_pulse - now - 5.0, deadline - now)
+            if budget > 20:
+                n = run_bounded("DEX backfill",
+                                lambda: c.dex.backfill(budget_requests=25),
+                                budget, default=-1)
+                if n and n > 0:
+                    log.info("DEX история: +%d свечей", n)
+                elif n == 0 and getattr(c.dex, "last_backfill_complete", False):
                     log.info("история пулов набрана на нужную глубину")
                 else:
-                    log.info("прогресса нет — вероятно лимит, "
-                             "продолжим на следующем прогоне")
-                break
-        return total
+                    log.info("история пулов недоступна — работаем живыми срезами")
+            continue
 
-    collect_dex(dex_deadline)
+        time.sleep(min(5.0, max(0.5, min(next_pulse, deadline) - time.time())))
 
-    # Инкремент по биржам: если истории нет, backfill наберёт её за раз,
-    # если есть — доберётся только свежее.
-    for src in alive:
-        if left() <= 30:
-            log.warning("время вышло, биржи собраны не полностью")
-            break
-        fn = src.update if before["rows"] else src.backfill
-        n = run_bounded(f"CEX {src.name} сбор", fn, min(180.0, left()))
-        log.info("CEX %s: +%d свечей", src.name, n)
+    log.info("живых срезов DEX за прогон: %d (раз в %d с)", pulses, pulse)
 
-    # Если после бирж время осталось — доберём ещё пулов.
-    collect_dex(deadline)
+    if cex_thread is not None:
+        cex_thread.join(timeout=max(0.0, left()))
+        if cex_thread.is_alive():
+            log.warning("биржи не успели к сроку — снимок выгружаем как есть")
 
     # --- 2б. Оповещения ---------------------------------------------------
     # Считаем связки по свежим данным и сообщаем о тех, что прибыльны

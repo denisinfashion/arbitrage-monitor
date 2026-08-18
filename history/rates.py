@@ -76,6 +76,9 @@ class RateGrid:
     token_name: Dict[str, str] = field(default_factory=dict)
     """тикер -> полное имя токена"""
 
+    quality_notes: Dict[str, str] = field(default_factory=dict)
+    """тикер -> почему он не участвует в расчёте (для интерфейса)"""
+
     @property
     def n_assets(self) -> int:
         return len(self.assets)
@@ -174,6 +177,8 @@ def build_grid(
     apply_slippage: bool = True,
     spot_only: Optional[bool] = None,
     bucket_seconds: Optional[int] = None,
+    drop_suspicious: bool = True,
+    min_pool_volume_usd: Optional[float] = None,
 ) -> RateGrid:
     """Превращает таблицу котировок в сетку исполнимых курсов.
 
@@ -201,6 +206,31 @@ def build_grid(
                      ", ".join(sorted(lev)[:8]))
         if df.empty:
             raise ValueError("после отсева токенов с плечом не осталось данных")
+
+    # Недостоверные данные DEX отсеиваются до отбора активов, иначе
+    # подделка с накрученным оборотом займёт место настоящего токена
+    # в списке из max_assets штук.
+    pools_df = _pools_frame(settings)
+    quality_notes: Dict[str, str] = {}
+    if drop_suspicious:
+        from .quality import MIN_POOL_VOLUME_USD, screen_pools
+        vol_floor = (MIN_POOL_VOLUME_USD if min_pool_volume_usd is None
+                     else float(min_pool_volume_usd))
+        screen = screen_pools(pools_df, vol_floor)
+        if screen.bad_pools and "pool" in df.columns:
+            bad = df["pool"].astype("string").isin(screen.bad_pools)
+            if bad.any():
+                log.info("отсеяно строк по качеству пулов: %d (%s)",
+                         int(bad.sum()), screen.summary())
+                df = df[~bad]
+        quality_notes = dict(screen.notes)
+        if quality_notes:
+            df = df[~df["base"].isin(quality_notes) & ~df["quote"].isin(quality_notes)]
+        if df.empty:
+            raise ValueError("после отсева недостоверных пулов не осталось данных")
+    else:
+        from .quality import screen_pools
+        screen = screen_pools(pools_df, 0.0)
 
     trade = float(trade_size_usd if trade_size_usd is not None else settings.trade_size_usd)
     # Гранулярность анализа отдельна от гранулярности сбора: биржи отдают
@@ -301,13 +331,35 @@ def build_grid(
     log_rate[:, diag, diag] = 0.0
     venue_idx[:, diag, diag] = -1
 
-    meta = _collect_meta(df, settings)
+    meta = _collect_meta(df, settings, pools_df)
+    # При споре тикеров ссылка должна вести на признанный настоящим
+    # контракт, а не на тот, что первым попался в справочнике.
+    for sym, addr in screen.address.items():
+        meta["token_address"][(settings.chain, sym)] = addr
+
     return RateGrid(times=times, assets=asset_list, venues=venue_list,
                     log_rate=log_rate, venue_idx=venue_idx, trade_size_usd=trade,
-                    **meta)
+                    quality_notes=quality_notes, **meta)
 
 
-def _collect_meta(df: pd.DataFrame, settings) -> dict:
+def _pools_frame(settings) -> Optional[pd.DataFrame]:
+    """Справочник пулов — из локальной базы или из облачного снимка.
+
+    Раньше он читался напрямую из SQLite. В облаке базы нет вовсе:
+    приложение живёт на одном скачанном parquet-файле, и справочник
+    молча оказывался пустым — вместе с ним пропадали адреса токенов,
+    а значит ссылки на обмен и расшифровка тикеров.
+    """
+    try:
+        from . import snapshot
+        return snapshot.pools(settings.chain)
+    except Exception as exc:  # noqa: BLE001 — справочник необязателен
+        log.debug("справочник пулов недоступен: %s", exc)
+        return None
+
+
+def _collect_meta(df: pd.DataFrame, settings,
+                  pools_df: Optional[pd.DataFrame] = None) -> dict:
     """Собирает справочники: сети площадок, ликвидность пар, адреса токенов.
 
     Всё это нужно интерфейсу, чтобы показать, в какой сети идёт обмен,
@@ -336,21 +388,23 @@ def _collect_meta(df: pd.DataFrame, settings) -> dict:
 
     # Адреса и имена токенов лежат в справочнике пулов, а не в котировках
     token_address, token_name = {}, {}
-    try:
-        from . import store
-        conn = store.connect(read_only=True)
-        rows = conn.execute(
-            "SELECT chain, base, quote, base_addr, quote_addr, "
-            "base_name, quote_name FROM pools").fetchall()
-        for r in rows:
-            for sym, addr, name in ((r["base"], r["base_addr"], r["base_name"]),
-                                    (r["quote"], r["quote_addr"], r["quote_name"])):
-                if sym and addr:
-                    token_address.setdefault((r["chain"], sym), addr)
-                if sym and name:
-                    token_name.setdefault(sym, name)
-    except Exception as exc:
-        log.debug("справочник токенов недоступен: %s", exc)
+    if pools_df is None:
+        pools_df = _pools_frame(settings)
+    if pools_df is not None and not pools_df.empty:
+        cols = pools_df.columns
+        for r in pools_df.to_dict("records"):
+            chain = str(r.get("chain") or settings.chain)
+            for sym_c, addr_c, name_c in (("base", "base_addr", "base_name"),
+                                          ("quote", "quote_addr", "quote_name")):
+                if sym_c not in cols:
+                    continue
+                sym = r.get(sym_c)
+                addr = r.get(addr_c) if addr_c in cols else None
+                name = r.get(name_c) if name_c in cols else None
+                if sym and addr and str(addr) not in ("nan", "None"):
+                    token_address.setdefault((chain, str(sym)), str(addr))
+                if sym and name and str(name) not in ("nan", "None"):
+                    token_name.setdefault(str(sym), str(name))
 
     return {"venue_chain": venue_chain, "venue_kind": venue_kind,
             "pair_liquidity": pair_liquidity, "pair_pool": pair_pool,

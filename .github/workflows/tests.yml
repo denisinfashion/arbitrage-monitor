@@ -26,3 +26,7 @@ jobs:
         run: python -m history.tests.test_cex_resilience
       - name: Оповещения
         run: python -m history.tests.test_alerts
+      - name: Отсев недостоверных данных
+        run: python -m history.tests.test_quality
+      - name: Отбор пулов DEX
+        run: python -m history.tests.test_dex_discovery

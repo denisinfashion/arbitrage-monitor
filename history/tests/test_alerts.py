@@ -55,12 +55,18 @@ check("с высоким порогом ничего не проходит", len
 
 print("\n3. Дедупликация")
 if picked:
-    sent = {picked[0].label: time.time()}
+    # Ключ молчания — набор токенов, а не подпись маршрута: одна и та же
+    # возможность приходит в нескольких перестановках, и по подписи они
+    # выглядели бы разными связками.
+    key = alerts.mute_key(picked[0])
+    sent = {key: time.time()}
     again = alerts.pick(cycles, cfg, sent)
-    check("уже отправленное не повторяется", picked[0].label not in [c.label for c in again])
-    old = {picked[0].label: time.time() - 3*3600}
+    check("уже отправленное не повторяется", key not in [alerts.mute_key(c) for c in again])
+    check("перестановки не считаются разными", 
+          len({alerts.mute_key(c) for c in picked}) == len(picked))
+    old = {key: time.time() - 3*3600}
     pruned = alerts._prune_sent(old, 90)
-    check("через срок молчания забывается", picked[0].label not in pruned)
+    check("через срок молчания забывается", key not in pruned)
 
 print("\n4. Настройка")
 check("без токена не настроено", not alerts.configured())

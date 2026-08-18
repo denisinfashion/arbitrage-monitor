@@ -52,6 +52,14 @@ class AlertConfig:
     min_margin_pct: float = 0.30
     """Порог чистой маржи в последней точке. Ниже — не беспокоим."""
 
+    max_margin_pct: float = 5.0
+    """Потолок правдоподобия. Выше — не находка, а неверная цена.
+
+    Введён после реального случая: в чат ушли пять сообщений о связке
+    с маржой около 578%. Столько не бывает — так выглядит одноимённая
+    подделка токена или пул, из которого нельзя продать.
+    """
+
     min_liquidity_usd: float = 200_000.0
     """Минимальный пул в цепочке: на мелких маржа неисполнима."""
 
@@ -73,6 +81,7 @@ class AlertConfig:
                 return default
         return cls(
             min_margin_pct=num("ALERT_MIN_MARGIN", 0.30),
+            max_margin_pct=num("ALERT_MAX_MARGIN", 5.0),
             min_liquidity_usd=num("ALERT_MIN_LIQUIDITY", 200_000.0),
             require_single_chain=os.environ.get("ALERT_SINGLE_CHAIN", "1") != "0",
             max_per_run=num("ALERT_MAX_PER_RUN", 5),
@@ -119,17 +128,35 @@ def _prune_sent(state: dict, mute_minutes: int) -> dict:
 # --------------------------------------------------------------------------
 
 
+def mute_key(cycle) -> str:
+    """Ключ, по которому связка считается «той же самой».
+
+    По подписи маршрута не годится: одна и та же возможность попадает
+    в таблицу в нескольких перестановках — USDT→BNB→X→USDT,
+    USDT→USDC→BNB→X→USDT и так далее. Все они держатся на одном и том же
+    странном курсе X, и пять сообщений об этом — пять сообщений об одном.
+    Поэтому ключ — набор задействованных токенов без порядка.
+    """
+    return "+".join(sorted(set(cycle.assets)))
+
+
 def pick(cycles: Sequence, cfg: AlertConfig, sent: dict) -> List:
     """Оставляет связки, о которых стоит сообщить."""
     import numpy as np
 
     out = []
+    wild = []
+    seen_keys = set()
     for c in cycles:
         m = c.margin_pct()
         if not len(m) or not np.isfinite(m[-1]):
             continue
         now_margin = float(m[-1])
         if now_margin < cfg.min_margin_pct:
+            continue
+
+        if cfg.max_margin_pct and now_margin > cfg.max_margin_pct:
+            wild.append((c.label, now_margin))
             continue
 
         liq = c.bottleneck_liquidity()
@@ -139,10 +166,17 @@ def pick(cycles: Sequence, cfg: AlertConfig, sent: dict) -> List:
         if cfg.require_single_chain and c.needs_transfer():
             continue
 
-        if c.label in sent:
+        key = mute_key(c)
+        if key in sent or key in seen_keys:
             continue
+        seen_keys.add(key)
 
         out.append((now_margin, c))
+
+    if wild:
+        log.warning("не отправлено как недостоверное (маржа выше %.1f%%): %s",
+                    cfg.max_margin_pct,
+                    "; ".join(f"{lbl} {mg:+.1f}%" for lbl, mg in wild[:5]))
 
     out.sort(key=lambda x: -x[0])
     return [c for _, c in out[: cfg.max_per_run]]
@@ -256,7 +290,7 @@ def notify(cycles: Sequence, cfg: Optional[AlertConfig] = None) -> int:
     for c in chosen:
         margin = float(c.margin_pct()[-1])
         if send(format_message(c, margin)):
-            sent[c.label] = time.time()
+            sent[mute_key(c)] = time.time()
             n += 1
             log.info("оповещение: %s (%+.3f%%)", c.label, margin)
 

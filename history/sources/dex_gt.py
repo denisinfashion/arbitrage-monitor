@@ -115,21 +115,54 @@ class GeckoTerminalSource:
     # ------------------------------------------------------------- discover
 
     def discover(self) -> int:
-        """Читает топ пулов сети и сохраняет их в справочник.
+        """Собирает пулы под наблюдение и снимает с них живые цены.
 
         Один запрос возвращает 20 пулов вместе с текущими ценами
         и резервами, поэтому этот же вызов работает как «живой» срез.
+
+        Источников три, и второй с третьим появились не сразу.
+
+        **Топ сети по обороту** — основа. Но сортировка не смотрит на
+        площадку, а в BNB Chain оборот почти весь у PancakeSwap: в сотне
+        лучших пулов посторонних площадок практически нет. Из-за этого
+        все найденные связки исполнялись в одном месте, хотя разница цен
+        между площадками — это ровно то, ради чего всё затевалось.
+
+        **Топ каждой площадки отдельно** это чинит: по одному запросу на
+        площадку, и у Biswap, Thena, SushiSwap появляются свои пулы.
+
+        **Список наблюдения** — на случай, когда интересует конкретный
+        токен, не проходящий по обороту ни в один топ. Ищется по тикеру,
+        адрес указывать не нужно.
         """
-        need_pages = min(
-            MAX_FREE_PAGES,
-            max(1, -(-self.s.dex_pool_limit // POOLS_PER_PAGE)),
-        )
         pools: List[dict] = []
         candles: List[Candle] = []
         now = int(time.time())
         tf_sec = self.s.timeframe_seconds()
         bucket = now - (now % tf_sec)
+        seen: set = set()
 
+        def take(payload) -> int:
+            tokens = self._index_included(payload.get("included", []))
+            items = payload.get("data", []) or []
+            n = 0
+            for item in items:
+                parsed = self._parse_pool(item, tokens)
+                if parsed is None or parsed["pool"] in seen:
+                    continue
+                seen.add(parsed["pool"])
+                pools.append(parsed)
+                snap = self._live_candle(parsed, bucket)
+                if snap:
+                    candles.append(snap)
+                n += 1
+            return n
+
+        # --- 1. Топ сети ---------------------------------------------------
+        need_pages = min(
+            MAX_FREE_PAGES,
+            max(1, -(-self.s.dex_pool_limit // POOLS_PER_PAGE)),
+        )
         for page in range(1, need_pages + 1):
             try:
                 payload = get_json(
@@ -142,25 +175,49 @@ class GeckoTerminalSource:
                 set_state(self.name, "discover", ok=False, error=str(exc))
                 log.warning("discover страница %d: %s", page, exc)
                 break
-
-            tokens = self._index_included(payload.get("included", []))
-            page_items = payload.get("data", []) or []
-            if not page_items:
+            if not take(payload):
                 break
 
-            for item in page_items:
-                parsed = self._parse_pool(item, tokens)
-                if parsed is None:
-                    continue
-                pools.append(parsed)
-                snap = self._live_candle(parsed, bucket)
-                if snap:
-                    candles.append(snap)
+        # --- 2. Топ каждой площадки ----------------------------------------
+        for dex in self.s.dex_venues or []:
+            try:
+                payload = get_json(
+                    f"{self.api}/networks/{self.chain}/dexes/{dex}/pools",
+                    params={"include": "base_token,quote_token,dex",
+                            "sort": "h24_volume_usd_desc"},
+                    headers=self.headers,
+                )
+            except HttpError as exc:
+                # Площадки нет в этой сети или её переименовали — не повод
+                # прерывать сбор: остальные источники от этого не страдают.
+                log.debug("площадка %s: %s", dex, exc)
+                continue
+            got = take(payload)
+            if got:
+                log.debug("%s: +%d пулов площадки %s", self.name, got, dex)
 
-        # отсев по ликвидности и обрезка до лимита
+        # --- 3. Список наблюдения ------------------------------------------
+        for token in self.s.watch_tokens or []:
+            try:
+                payload = get_json(
+                    f"{self.api}/search/pools",
+                    params={"query": token, "network": self.chain,
+                            "include": "base_token,quote_token,dex"},
+                    headers=self.headers,
+                )
+            except HttpError as exc:
+                log.debug("поиск пулов %s: %s", token, exc)
+                continue
+            got = take(payload)
+            log.info("%s: список наблюдения, %s — пулов найдено %d",
+                     self.name, token, got)
+
+        # Отсев по ликвидности. Дальше — не просто «сто самых крупных»:
+        # сначала каждой площадке отдаётся её квота, и лишь остаток лимита
+        # разыгрывается по общему размеру. Иначе крупные пулы одной
+        # площадки снова вытеснят всех остальных.
         pools = [p for p in pools if (p["reserve_usd"] or 0) >= self.s.min_pool_reserve_usd]
-        pools.sort(key=lambda p: p["reserve_usd"] or 0, reverse=True)
-        pools = pools[: self.s.dex_pool_limit]
+        pools = self._apply_venue_quota(pools)
         keep = {p["pool"] for p in pools}
 
         write_pools(pools)
@@ -169,9 +226,45 @@ class GeckoTerminalSource:
 
         set_state(self.name, "discover", ok=bool(pools),
                   error="" if pools else "пулы не получены", rows=written)
-        log.info("%s: %d пулов под наблюдением, %d живых котировок",
-                 self.name, len(pools), written)
+        by_dex: Dict[str, int] = {}
+        for p in pools:
+            by_dex[p["dex"]] = by_dex.get(p["dex"], 0) + 1
+        top = sorted(by_dex.items(), key=lambda kv: -kv[1])[:6]
+        log.info("%s: %d пулов под наблюдением, %d живых котировок; "
+                 "площадок %d (%s)", self.name, len(pools), written, len(by_dex),
+                 ", ".join(f"{d}:{n}" for d, n in top))
         return len(pools)
+
+    def _apply_venue_quota(self, pools: List[dict]) -> List[dict]:
+        """Оставляет каждой площадке её квоту, остаток — по размеру пула.
+
+        Без этого шага отбор «сто самых крупных» отдаёт весь список одной
+        площадке, и связки перестают быть межплощадочными.
+        """
+        quota = max(0, int(getattr(self.s, "dex_venue_quota", 0)))
+        limit = int(self.s.dex_pool_limit)
+
+        pools.sort(key=lambda p: p["reserve_usd"] or 0, reverse=True)
+        if not quota:
+            return pools[:limit]
+
+        chosen: List[dict] = []
+        taken: Dict[str, int] = {}
+        for p in pools:
+            d = p["dex"]
+            if taken.get(d, 0) < quota:
+                taken[d] = taken.get(d, 0) + 1
+                chosen.append(p)
+            if len(chosen) >= limit:
+                return chosen
+
+        picked = {p["pool"] for p in chosen}
+        for p in pools:
+            if len(chosen) >= limit:
+                break
+            if p["pool"] not in picked:
+                chosen.append(p)
+        return chosen
 
     def _index_included(self, included: List[dict]) -> Dict[str, dict]:
         """id -> объект для секции included (токены и dex)."""

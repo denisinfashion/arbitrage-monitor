@@ -447,6 +447,7 @@ def find_cycles(
     per_step: int = 12,
     gas_per_dex_leg_usd: float = 0.15,
     min_margin_pct: Optional[float] = None,
+    max_margin_pct: Optional[float] = None,
     sort_by: str = "окна",
     settings=SETTINGS,
 ) -> Tuple[pd.DataFrame, List[Cycle]]:
@@ -513,6 +514,18 @@ def find_cycles(
 
     df = pd.DataFrame(rows)
     df = df[df["Макс %"] > min_margin]
+
+    # Потолок правдоподобия. Трёхзначная маржа — это не находка, а неверная
+    # цена: одноимённая подделка, налог на перевод, пул без сделок. Такие
+    # строки не просто бесполезны, они вытесняют настоящие из верха таблицы.
+    if max_margin_pct is not None and not df.empty:
+        wild = df["Макс %"] > float(max_margin_pct)
+        if wild.any():
+            log.warning("отсеяно как недостоверное (маржа выше %.1f%%): %d — %s",
+                        float(max_margin_pct), int(wild.sum()),
+                        "; ".join(df.loc[wild, "Связка"].head(5)))
+            df = df[~wild]
+
     if df.empty:
         return df, cycles
 
