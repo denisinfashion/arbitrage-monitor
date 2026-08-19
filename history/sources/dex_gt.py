@@ -116,6 +116,42 @@ class GeckoTerminalSource:
 
     # ------------------------------------------------------------- discover
 
+    def directory_state(self) -> Tuple[int, float, set]:
+        """Сколько пулов в справочнике, как давно обновлялись, какие токены."""
+        from ..store import connect
+        try:
+            rows = connect(read_only=True).execute(
+                "SELECT base, quote, updated_at FROM pools WHERE chain=?",
+                (self.chain,)).fetchall()
+        except Exception:  # noqa: BLE001 — базы может не быть вовсе
+            return 0, 1e9, set()
+        if not rows:
+            return 0, 1e9, set()
+        newest = max((r["updated_at"] or 0) for r in rows)
+        tokens = {str(r["base"]) for r in rows} | {str(r["quote"]) for r in rows}
+        return len(rows), max(0.0, time.time() - newest), tokens
+
+    def needs_full_discovery(self, max_age_sec: float = 3600.0) -> bool:
+        """Нужен ли полный поиск, или хватит среза по известным пулам.
+
+        Полный поиск стоит два десятка запросов и три минуты — на прогоне
+        в десять минут это треть бюджета, и именно из-за него срезов
+        выходило два вместо трёх. Но пулы не появляются и не исчезают
+        каждые пятнадцать минут: справочник переживает прогон внутри
+        снимка, и если он свежий и полный, искать заново нечего.
+        """
+        count, age, tokens = self.directory_state()
+        if count < max(10, int(self.s.dex_pool_limit * 0.5)):
+            return True
+        if age > max_age_sec:
+            return True
+        missing = [w for w in load_watchlist(self.s) if w not in tokens]
+        if missing:
+            log.info("%s: в справочнике нет %s — нужен полный поиск",
+                     self.name, ", ".join(missing[:5]))
+            return True
+        return False
+
     def discover(self) -> int:
         """Собирает пулы под наблюдение и снимает с них живые цены.
 
@@ -208,7 +244,14 @@ class GeckoTerminalSource:
         # был бы бесполезен ровно там, где он нужен: токен, не проходящий
         # в топ по обороту, обычно и по размеру пула не проходит общий порог.
         before_watch = len(pools)
+        _, _, known_tokens = self.directory_state()
         for token in load_watchlist(self.s):
+            # Тикер, чьи пулы уже в справочнике, искать заново незачем:
+            # цены обновит срез, а поиск стоит запрос из скудной квоты.
+            if token in known_tokens and known_tokens:
+                log.debug("%s: %s уже в справочнике, поиск пропущен",
+                          self.name, token)
+                continue
             try:
                 payload = get_json(
                     f"{self.api}/search/pools",

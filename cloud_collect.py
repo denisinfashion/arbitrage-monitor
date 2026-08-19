@@ -198,12 +198,16 @@ def main(argv=None) -> int:
         return deadline - time.time()
 
     # DEX идёт первым: он дешевле по времени и именно ради него всё затевалось.
-    # Один вызов discover сразу даёт свежие цены всех наблюдаемых пулов.
     if c.dex:
-        # Полный поиск дорог по запросам, поэтому делается один раз
-        # за прогон и с запасом по времени: при отказах 429 источник
-        # выжидает, и в две минуты поиск переставал укладываться.
-        run_bounded("DEX discover", c.dex.discover, min(240.0, left()))
+        # Полный поиск нужен не каждый прогон. Справочник пулов переезжает
+        # внутри снимка, и если он свежий и покрывает список наблюдения,
+        # искать нечего — достаточно обновить цены. Полный поиск занимал
+        # три минуты из десяти, и именно поэтому срезов выходило два.
+        if c.dex.needs_full_discovery():
+            run_bounded("DEX поиск", c.dex.discover, min(240.0, left()))
+        else:
+            log.info("справочник пулов свежий — полный поиск пропущен")
+            run_bounded("DEX срез", c.dex.pulse, min(90.0, left()))
 
     # Биржи: discover каждой ограничен, чтобы недоступная площадка
     # не съела прогон целиком.
@@ -240,21 +244,35 @@ def main(argv=None) -> int:
                  ", ".join(s.name for s in alive))
 
     def cex_worker() -> None:
-        for i, src in enumerate(alive):
-            if left() <= 30:
-                log.warning("время вышло, биржи собраны не полностью")
-                return
-            # Каждой бирже отдаётся всё оставшееся время за вычетом
-            # минимального запаса для тех, кто ещё не отработал. Деление
-            # поровну выглядело справедливым, но на десяти площадках
-            # давало по 66 секунд каждой, и htx с bitfinex срезались
-            # ровно на подходе — при том что следующие за ними
-            # укладывались в двадцать секунд и остаток пропадал.
-            reserve = 45.0 * max(0, len(alive) - i - 1)
-            share = max(60.0, min(240.0, left() - reserve))
+        """Биржи опрашиваются параллельно, по нескольку сразу.
+
+        Последовательный обход не помещался ни в какое деление времени:
+        девяти площадкам на шести с половиной минутах доставалось меньше
+        минуты каждой, и kucoin с htx срезались по таймауту — при том что
+        их потоки всё равно дорабатывали в фоне и записывали по четыреста
+        тысяч свечей. То есть данные приходили, а учёт врал.
+
+        Работа сетевая и почти всё время проходит в ожидании ответа,
+        поэтому несколько площадок одновременно не мешают друг другу:
+        у каждой свой объект ccxt со своим троттлингом, а запись в SQLite
+        идёт через отдельное соединение на поток.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def one(src):
             fn = src.update if before["rows"] else src.backfill
-            n = run_bounded(f"CEX {src.name} сбор", fn, min(share, left()))
-            log.info("CEX %s: +%d свечей", src.name, n)
+            return src.name, fn()
+
+        workers = min(4, max(1, len(alive)))
+        log.info("биржи опрашиваются по %d одновременно", workers)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(one, s): s for s in alive}
+            for fut in as_completed(futures, timeout=max(30.0, left())):
+                try:
+                    name, n = fut.result()
+                    log.info("CEX %s: +%d свечей", name, n)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("CEX %s: %s", futures[fut].name, exc)
 
     cex_thread = None
     if alive:
