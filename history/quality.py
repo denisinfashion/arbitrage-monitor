@@ -85,6 +85,11 @@ CANONICAL: Dict[str, Dict[str, str]] = {
         "BUSD": "0xe9e7cea3dedca5984780bafc599bd69add087d56",
         "FDUSD": "0xc5f0f7b66764f6ec8c8dff7ba683102295e16409",
         "DAI": "0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3",
+        # Binance-Peg Aave Token. Добавлен после разбора связки
+        # USDT - AAVE - DAI - USDT: тикер AAVE в BNB Chain носит
+        # не только он, и подделка с тем же тикером — самый дешёвый
+        # способ показать спред, которого нет.
+        "AAVE": "0xfb6115445bff7b52feb98650c87f44907e58f802",
         "WBNB": "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
         "BNB": "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
         "BTCB": "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c",
