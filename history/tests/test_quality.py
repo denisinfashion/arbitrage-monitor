@@ -16,7 +16,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from history.quality import (CANONICAL, MIN_POOL_VOLUME_USD, implausible,
+from history.quality import (CANONICAL, MIN_POOL_TURNOVER,
+                             MIN_POOL_VOLUME_USD, implausible,
                              screen_pools)
 
 REAL_USDT = CANONICAL["bsc"]["USDT"]
@@ -279,6 +280,74 @@ def test_11_broken_directory_degrades_quietly():
     finally:
         rates._pools_frame = orig
     print("11 ok: сбой справочника не ломает расчёт")
+
+
+def test_12_turnover_beats_absolute_volume():
+    """Живые данные по AAVE: абсолютный порог оборота отсекал здоровые пулы.
+
+    Пул AAVE/USDT с резервом $12 159 и оборотом $4 696 за сутки
+    оборачивается на 39% — работает. Прежний порог в $25 000 его
+    выбрасывал, и у AAVE оставалась одна пара, из-за чего цикл через
+    него не замыкался. Подделку же — резерв $900 000 при обороте $90 —
+    порог по величине оборота пропустил бы.
+    """
+    A = "0xfb6115445bff7b52feb98650c87f44907e58f802"
+
+    def pool(i, base, quote, reserve, volume, dex="uniswap-bsc"):
+        addr = {"AAVE": A}.get
+        return {"chain": "bsc", "pool": f"0x{i}", "dex": dex,
+                "base": base, "quote": quote,
+                "base_addr": addr(base) or f"0x{base.lower()}",
+                "quote_addr": addr(quote) or f"0x{quote.lower()}",
+                "base_name": "", "quote_name": "",
+                "reserve_usd": reserve, "volume_24h": volume}
+
+    df = pd.DataFrame([
+        pool(0, "AAVE", "WBNB", 104_711, 58_057),                  # 55%
+        pool(1, "AAVE", "WBNB", 49_119, 17_399, "pancakeswap-v3"), # 35%
+        pool(2, "AAVE", "USDT", 12_159, 4_696),                    # 39%
+        pool(3, "AAVE", "WBNB", 23_599, 492, "apeswap"),           # 2.1%
+        pool(4, "BNB", "AAVE", 15_740, 18, "uniswap-v4"),          # 0.1%
+        pool(5, "FAKE", "USDT", 900_000, 90),                      # 0.01%
+    ])
+    s = screen_pools(df)
+
+    assert "0x0" not in s.bad_pools, "крупный живой пул выброшен"
+    assert "0x1" not in s.bad_pools, "средний живой пул выброшен"
+    assert "0x2" not in s.bad_pools, "маленький, но оборотистый пул выброшен"
+    assert "0x4" in s.bad_pools, "мёртвый пул остался"
+    assert "0x5" in s.bad_pools, "надутый резерв без оборота остался"
+
+    # Главное следствие: у AAVE теперь два разных партнёра, а значит
+    # цикл USDT -> AAVE -> WBNB -> USDT замыкается.
+    alive = df[~df["pool"].isin(s.bad_pools)]
+    partners = set(alive["base"]) | set(alive["quote"])
+    partners -= {"AAVE"}
+    assert {"WBNB", "USDT"} <= partners, partners
+    assert "AAVE" not in s.notes, s.notes
+    print(f"12 ok: оборот к резерву различает живой пул и надутый "
+          f"(порог {MIN_POOL_TURNOVER * 100:.0f}% в сутки)")
+
+
+def test_13_turnover_scales_with_pool_size():
+    """Правило относительное: одинаковая оборачиваемость — одинаковый вердикт."""
+    def pool(i, reserve, volume):
+        return {"chain": "bsc", "pool": f"0x{i}", "dex": "d",
+                "base": f"T{i}", "quote": "USDT",
+                "base_addr": f"0xt{i}", "quote_addr": "0xu",
+                "base_name": "", "quote_name": "",
+                "reserve_usd": reserve, "volume_24h": volume}
+
+    # 20% оборачиваемости при очень разных размерах
+    df = pd.DataFrame([pool(0, 10_000, 2_000), pool(1, 10_000_000, 2_000_000)])
+    s = screen_pools(df)
+    assert not s.bad_pools, s.bad_pools
+
+    # 0.5% оборачиваемости — тоже при разных размерах
+    df2 = pd.DataFrame([pool(2, 100_000, 500), pool(3, 10_000_000, 50_000)])
+    s2 = screen_pools(df2)
+    assert {"0x2", "0x3"} <= s2.bad_pools, s2.bad_pools
+    print("13 ok: вердикт зависит от оборачиваемости, а не от размера")
 
 
 def run_all():

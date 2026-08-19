@@ -229,6 +229,7 @@ def build_grid(
     bucket_seconds: Optional[int] = None,
     drop_suspicious: bool = True,
     min_pool_volume_usd: Optional[float] = None,
+    min_liquidity_usd: float = 0.0,
 ) -> RateGrid:
     """Превращает таблицу котировок в сетку исполнимых курсов.
 
@@ -289,6 +290,25 @@ def build_grid(
             raise ValueError("после отсева недостоверных пулов не осталось данных")
 
     trade = float(trade_size_usd if trade_size_usd is not None else settings.trade_size_usd)
+
+    # Порог ликвидности имеет смысл только относительно объёма сделки.
+    # Проскальзывание в пуле постоянного произведения зависит не от
+    # размера пула, а от отношения сделки к нему: тысяча долларов против
+    # пяти тысяч и сто против пятисот дают одни и те же 29% потерь.
+    # Поэтому здесь отсекается не «мелкий пул», а «мелкий для этой суммы».
+    if min_liquidity_usd and "liquidity_usd" in df.columns:
+        liq_col = pd.to_numeric(df["liquidity_usd"], errors="coerce")
+        is_dex = df["venue_kind"].to_numpy() == "dex"
+        thin = is_dex & liq_col.notna().to_numpy() & (liq_col.to_numpy() < min_liquidity_usd)
+        if thin.any():
+            log.info("отсеяно строк по ликвидности (пул меньше $%s под объём $%s): %d",
+                     f"{min_liquidity_usd:,.0f}".replace(",", " "),
+                     f"{trade:,.0f}".replace(",", " "), int(thin.sum()))
+            df = df[~thin]
+        if df.empty:
+            raise ValueError(
+                "После отсева по ликвидности не осталось данных. "
+                "Уменьшите требование к размеру пула или объём сделки.")
     # Гранулярность анализа отдельна от гранулярности сбора: биржи отдают
     # минутные свечи, а DEX на бесплатной инфраструктуре обновляется раз
     # в несколько минут. Сводим всё к общему интервалу, иначе строки DEX

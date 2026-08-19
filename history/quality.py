@@ -52,8 +52,22 @@ MAX_PLAUSIBLE_MARGIN_PCT = 5.0
 процентов оставлены с запасом на редкие всплески волатильности.
 """
 
-MIN_POOL_VOLUME_USD = 25_000.0
-"""Минимальный оборот пула за сутки. Пулы тише этого не дают цены."""
+MIN_POOL_VOLUME_USD = 500.0
+"""Абсолютный минимум оборота за сутки. Ниже — пул мёртв, а не мал."""
+
+MIN_POOL_TURNOVER = 0.02
+"""Минимальный оборот за сутки в долях от резерва.
+
+Абсолютный порог здесь не работает, и это выяснилось на живых данных.
+Пул AAVE/USDT с резервом $12 000 и оборотом $4 700 отсеивался порогом
+в $25 000, хотя оборачивается за сутки на 39% — это здоровый рабочий
+пул, просто небольшой. А подделка с накрученным резервом в $900 000
+и оборотом в $90 порог по величине оборота прошла бы легко.
+
+Различает их не размер оборота, а его отношение к резерву. Настоящий
+пул оборачивается за сутки на проценты и десятки процентов; пул,
+надутый собственным токеном по выдуманной цене, — на сотые доли.
+"""
 
 NEVER_DROP = {"USDT", "USDC", "BUSD", "DAI", "FDUSD", "BNB", "WBNB",
               "ETH", "WETH", "BTC", "BTCB", "WBTC"}
@@ -138,7 +152,8 @@ def _norm_addr(value) -> str:
 
 
 def screen_pools(pools: Optional[pd.DataFrame],
-                 min_volume_usd: float = MIN_POOL_VOLUME_USD) -> Screen:
+                 min_volume_usd: float = MIN_POOL_VOLUME_USD,
+                 turnover: float = MIN_POOL_TURNOVER) -> Screen:
     """Проверяет справочник пулов и решает, чему можно верить.
 
     Ожидаемые колонки: chain, pool, base, quote, base_addr, quote_addr,
@@ -164,15 +179,24 @@ def screen_pools(pools: Optional[pd.DataFrame],
     # --- 1. Тихие пулы ----------------------------------------------------
     # Оборот подделать дороже, чем резерв: он требует встречных сделок.
     # Пул без оборота цену не задаёт, каким бы большим он ни выглядел.
-    if min_volume_usd > 0:
+    #
+    # Сравнивается не величина оборота, а его отношение к резерву:
+    # маленький пул с высокой оборачиваемостью живой, огромный с нулевой —
+    # нет. Абсолютный порог остаётся только как отсечка совсем мёртвых.
+    if min_volume_usd > 0 or turnover > 0:
         vol = pd.to_numeric(df["volume_24h"], errors="coerce")
+        res = pd.to_numeric(df["reserve_usd"], errors="coerce")
         # NaN означает «оборот неизвестен» — такие пулы не наказываем,
         # иначе на старом снимке отсеется всё сразу.
-        quiet = vol.notna() & (vol < min_volume_usd)
+        known = vol.notna()
+        too_small = known & (vol < min_volume_usd)
+        too_slow = known & res.notna() & (res > 0) & (vol < res * turnover)
+        quiet = too_small | too_slow
         if quiet.any():
             out.bad_pools |= set(df.loc[quiet, "pool"].astype(str))
-            log.info("тихих пулов (оборот < $%s за сутки): %d",
-                     f"{min_volume_usd:,.0f}".replace(",", " "), int(quiet.sum()))
+            log.info("тихих пулов: %d (оборот меньше $%s или меньше %.0f%% "
+                     "от резерва за сутки)", int(quiet.sum()),
+                     f"{min_volume_usd:,.0f}".replace(",", " "), turnover * 100)
         df = df[~quiet]
 
     if df.empty:
@@ -232,11 +256,12 @@ def screen_pools(pools: Optional[pd.DataFrame],
     # --- 3. Символы, от которых ничего не осталось ------------------------
     # Считаем по исходному справочнику, а не по отфильтрованному: символ,
     # все пулы которого оказались тихими, до второго шага просто не дошёл.
-    _note_orphans(out, pools, min_volume_usd)
+    _note_orphans(out, pools, min_volume_usd, turnover)
     return out
 
 
-def _note_orphans(out: Screen, pools: pd.DataFrame, min_volume_usd: float) -> None:
+def _note_orphans(out: Screen, pools: pd.DataFrame, min_volume_usd: float,
+                  turnover: float = MIN_POOL_TURNOVER) -> None:
     """Заполняет причины для символов, у которых не осталось ни одного пула."""
     have = {"base", "quote", "pool"} <= set(pools.columns)
     if not have:

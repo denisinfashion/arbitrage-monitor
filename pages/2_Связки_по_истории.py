@@ -114,6 +114,25 @@ with st.sidebar:
 
     gas_leg = st.number_input("Газ за своп на DEX, $", 0.0, 50.0, 0.15, step=0.05)
 
+    # Порог ликвидности задаётся кратностью к объёму, а не абсолютным
+    # числом: проскальзывание зависит от отношения сделки к пулу, и один
+    # и тот же пул хорош для сотни долларов и безнадёжен для пяти тысяч.
+    liq_mult = st.slider("Минимальный пул, × от объёма", 0, 500, 100, step=10,
+                         help="Пулы мельче этого в расчёт не идут. "
+                              "Ноль — не отсеивать: проскальзывание всё "
+                              "равно посчитается и сделает такие связки "
+                              "убыточными само.")
+    min_liq = float(liq_mult) * float(trade_size)
+    if liq_mult:
+        # loss = S / (P/2 + S) — потери на одной ноге при этом пороге
+        loss = 100.0 * trade_size / (min_liq / 2.0 + trade_size)
+        st.caption(
+            f"Пул от ${min_liq:,.0f} — это до {loss:.2f}% проскальзывания "
+            f"на одной ноге при объёме ${trade_size:,.0f}".replace(",", " ")
+        )
+    else:
+        st.caption("Порог выключен: мелкие пулы отсеет само проскальзывание")
+
     st.divider()
     # Потолок считается от памяти под конкретное окно, а не задан числом.
     # При часовом шаге точек в сетке в двенадцать раз меньше, чем при
@@ -233,7 +252,7 @@ def compute(window_h: float, anchor: str, max_legs: int, trade_size: float,
             kinds: tuple, apply_slip: bool, staleness: int, gas_leg: float,
             max_assets: int, top_n: int, min_margin: float, sort_by: str,
             spot_only: bool, granularity: str, one_chain: bool,
-            max_margin: float, trust: bool, _bust: int):
+            max_margin: float, trust: bool, min_liq: float, _bust: int):
     since = int(time.time() - window_h * 3600)
     quotes = snapshot.read_quotes(since_ts=since, venue_kinds=list(kinds))
     if quotes.empty:
@@ -247,7 +266,8 @@ def compute(window_h: float, anchor: str, max_legs: int, trade_size: float,
         grid = build_grid(quotes, settings=s, trade_size_usd=trade_size,
                           venue_kinds=list(kinds), max_assets=max_assets,
                           apply_slippage=apply_slip, spot_only=spot_only,
-                          **_supported(build_grid, drop_suspicious=trust))
+                          **_supported(build_grid, drop_suspicious=trust,
+                                       min_liquidity_usd=min_liq))
         table, cycles = find_cycles(grid, anchor=anchor, max_legs=max_legs,
                                     top=top_n, gas_per_dex_leg_usd=gas_leg,
                                     min_margin_pct=min_margin,
@@ -290,7 +310,8 @@ with st.spinner("Строю сетку курсов и ищу связки…"):
     grid, table, cycles, err = compute(
         window_h, anchor, max_legs, trade_size, tuple(kinds), apply_slip,
         staleness, gas_leg, max_assets, top_n, min_margin, sort_by, spot_only,
-        granularity, one_chain, max_margin, trust, st.session_state.bust_paths,
+        granularity, one_chain, max_margin, trust, min_liq,
+        st.session_state.bust_paths,
     )
 
 if err:
