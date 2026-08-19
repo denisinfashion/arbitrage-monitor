@@ -70,6 +70,14 @@ class RateGrid:
     pair_pool: Dict[Tuple[str, str, str], str] = field(default_factory=dict)
     """(площадка, актив, актив) -> адрес пула"""
 
+    pair_volume_usd: Dict[Tuple[str, str, str], float] = field(default_factory=dict)
+    """(площадка, актив, актив) -> типичный оборот свечи в долларах.
+
+    Нужен разбору по шагам: на биржах проскальзывание оценивается от
+    оборота, и без этого числа издержки ноги не разложить на комиссию
+    и проскальзывание.
+    """
+
     token_address: Dict[Tuple[str, str], str] = field(default_factory=dict)
     """(сеть, тикер) -> адрес контракта"""
 
@@ -212,11 +220,19 @@ def build_grid(
     # в списке из max_assets штук.
     pools_df = _pools_frame(settings)
     quality_notes: Dict[str, str] = {}
+    from .quality import MIN_POOL_VOLUME_USD, Screen, screen_pools
+    vol_floor = (MIN_POOL_VOLUME_USD if min_pool_volume_usd is None
+                 else float(min_pool_volume_usd))
+    try:
+        screen = screen_pools(pools_df, vol_floor if drop_suspicious else 0.0)
+    except Exception as exc:  # noqa: BLE001
+        # Отсев — предохранитель, а не обязательный этап. Если он сам
+        # споткнулся о данные, правильное поведение — посчитать без него
+        # и сказать об этом, а не оставить пользователя без страницы.
+        log.warning("проверка качества пулов не отработала: %s", exc)
+        screen = Screen()
+
     if drop_suspicious:
-        from .quality import MIN_POOL_VOLUME_USD, screen_pools
-        vol_floor = (MIN_POOL_VOLUME_USD if min_pool_volume_usd is None
-                     else float(min_pool_volume_usd))
-        screen = screen_pools(pools_df, vol_floor)
         if screen.bad_pools and "pool" in df.columns:
             bad = df["pool"].astype("string").isin(screen.bad_pools)
             if bad.any():
@@ -225,12 +241,10 @@ def build_grid(
                 df = df[~bad]
         quality_notes = dict(screen.notes)
         if quality_notes:
-            df = df[~df["base"].isin(quality_notes) & ~df["quote"].isin(quality_notes)]
+            drop = set(quality_notes)
+            df = df[~df["base"].isin(drop) & ~df["quote"].isin(drop)]
         if df.empty:
             raise ValueError("после отсева недостоверных пулов не осталось данных")
-    else:
-        from .quality import screen_pools
-        screen = screen_pools(pools_df, 0.0)
 
     trade = float(trade_size_usd if trade_size_usd is not None else settings.trade_size_usd)
     # Гранулярность анализа отдельна от гранулярности сбора: биржи отдают
@@ -352,10 +366,35 @@ def _pools_frame(settings) -> Optional[pd.DataFrame]:
     """
     try:
         from . import snapshot
-        return snapshot.pools(settings.chain)
+        return _denullify(snapshot.pools(settings.chain))
     except Exception as exc:  # noqa: BLE001 — справочник необязателен
         log.debug("справочник пулов недоступен: %s", exc)
         return None
+
+
+def _denullify(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Приводит пропуски к обычным None и NaN.
+
+    Снимок читается из Parquet, и pandas отдаёт колонки в «расширенных»
+    типах, где пропуск — это pd.NA. У этого значения нет истинности:
+    выражение `if sym and addr` на нём не возвращает False, а падает с
+    TypeError. Ровно так приложение и сломалось в облаке, хотя локально
+    на той же логике работало — там справочник приходил из SQLite
+    с обычными None.
+
+    Чинить каждую проверку по отдельности бессмысленно: пропуск может
+    появиться в любой колонке. Приводим типы один раз на входе.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for col in out.columns:
+        if pd.api.types.is_extension_array_dtype(out[col].dtype):
+            if pd.api.types.is_numeric_dtype(out[col].dtype):
+                out[col] = pd.to_numeric(out[col], errors="coerce").astype("float64")
+            else:
+                out[col] = out[col].astype(object).where(out[col].notna(), None)
+    return out
 
 
 def _collect_meta(df: pd.DataFrame, settings,
@@ -386,28 +425,66 @@ def _collect_meta(df: pd.DataFrame, settings,
                     pair_pool[(v, b, q)] = str(pools.iloc[0])
                     pair_pool[(v, q, b)] = str(pools.iloc[0])
 
+    # Оборот в долларах: для DEX он уже в долларах, для CEX объём свечи
+    # выражен в базовом активе и переводится по цене той же свечи.
+    pair_volume_usd = {}
+    if {"volume", "close"} <= set(df.columns):
+        vol = df.dropna(subset=["volume", "close"])
+        if not vol.empty:
+            v = vol.copy()
+            is_cex = v["venue_kind"].to_numpy() == "cex"
+            v["_usd"] = np.where(is_cex, v["volume"] * v["close"], v["volume"])
+            for (ven, b, q), grp in v.groupby(["venue", "base", "quote"], sort=False):
+                val = float(grp["_usd"].median())
+                if val > 0:
+                    pair_volume_usd[(ven, b, q)] = val
+                    pair_volume_usd[(ven, q, b)] = val
+
     # Адреса и имена токенов лежат в справочнике пулов, а не в котировках
     token_address, token_name = {}, {}
     if pools_df is None:
         pools_df = _pools_frame(settings)
     if pools_df is not None and not pools_df.empty:
-        cols = pools_df.columns
-        for r in pools_df.to_dict("records"):
-            chain = str(r.get("chain") or settings.chain)
-            for sym_c, addr_c, name_c in (("base", "base_addr", "base_name"),
-                                          ("quote", "quote_addr", "quote_name")):
-                if sym_c not in cols:
-                    continue
-                sym = r.get(sym_c)
-                addr = r.get(addr_c) if addr_c in cols else None
-                name = r.get(name_c) if name_c in cols else None
-                if sym and addr and str(addr) not in ("nan", "None"):
-                    token_address.setdefault((chain, str(sym)), str(addr))
-                if sym and name and str(name) not in ("nan", "None"):
-                    token_name.setdefault(str(sym), str(name))
+        cols = set(pools_df.columns)
+
+        def text(value) -> str:
+            """Пусто для любого вида пропуска, иначе строка.
+
+            Проверять истинность значения напрямую нельзя: из Parquet
+            приходит pd.NA, у которого нет булева значения.
+            """
+            if value is None:
+                return ""
+            try:
+                if pd.isna(value):
+                    return ""
+            except (TypeError, ValueError):
+                pass
+            s = str(value).strip()
+            return "" if s.lower() in ("nan", "none", "<na>") else s
+
+        try:
+            for r in pools_df.to_dict("records"):
+                chain = text(r.get("chain")) or settings.chain
+                for sym_c, addr_c, name_c in (("base", "base_addr", "base_name"),
+                                              ("quote", "quote_addr", "quote_name")):
+                    if sym_c not in cols:
+                        continue
+                    sym = text(r.get(sym_c))
+                    addr = text(r.get(addr_c)) if addr_c in cols else ""
+                    name = text(r.get(name_c)) if name_c in cols else ""
+                    if sym and addr:
+                        token_address.setdefault((chain, sym), addr)
+                    if sym and name:
+                        token_name.setdefault(sym, name)
+        except Exception as exc:  # noqa: BLE001
+            # Справочник — украшение: имена токенов и ссылки на обмен.
+            # Ронять из-за него расчёт нельзя.
+            log.warning("справочник токенов прочитан не полностью: %s", exc)
 
     return {"venue_chain": venue_chain, "venue_kind": venue_kind,
             "pair_liquidity": pair_liquidity, "pair_pool": pair_pool,
+            "pair_volume_usd": pair_volume_usd,
             "token_address": token_address, "token_name": token_name}
 
 

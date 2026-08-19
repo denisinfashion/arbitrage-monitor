@@ -115,11 +115,26 @@ class Screen:
         return ", ".join(parts)
 
 
-def _norm_addr(value) -> str:
+def _missing(value) -> bool:
+    """Пропуск любого вида: None, NaN или pd.NA.
+
+    Проверять истинность напрямую нельзя: из Parquet приходит pd.NA,
+    у которого нет булева значения, и `if value` падает с TypeError.
+    """
     if value is None:
+        return True
+    try:
+        result = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    return bool(result) if isinstance(result, bool) else False
+
+
+def _norm_addr(value) -> str:
+    if _missing(value):
         return ""
     s = str(value).strip().lower()
-    return "" if s in ("", "none", "nan") else s
+    return "" if s in ("", "none", "nan", "<na>") else s
 
 
 def screen_pools(pools: Optional[pd.DataFrame],
@@ -244,8 +259,13 @@ def _note_orphans(out: Screen, pools: pd.DataFrame, min_volume_usd: float) -> No
                 alive[sym] = alive.get(sym, 0) + 1
             elif vol_col:
                 v = r.get(vol_col)
-                is_quiet = v is not None and v == v and float(v) < min_volume_usd
-                quiet_only[sym] = quiet_only.get(sym, True) and bool(is_quiet)
+                is_quiet = False
+                if not _missing(v):
+                    try:
+                        is_quiet = float(v) < min_volume_usd
+                    except (TypeError, ValueError):
+                        is_quiet = False
+                quiet_only[sym] = quiet_only.get(sym, True) and is_quiet
 
     # Опорные активы не отсеиваются никогда. Если убрать USDT из-за того,
     # что в снимке не оказалось оборота, расчёт останется без якоря и
@@ -264,7 +284,8 @@ def _note_orphans(out: Screen, pools: pd.DataFrame, min_volume_usd: float) -> No
 
 
 def _remember_name(out: Screen, symbol, grp) -> None:
-    names = [str(x).strip() for x in grp["name"].tolist() if str(x).strip()]
+    names = [str(x).strip() for x in grp["name"].tolist() if not _missing(x)]
+    names = [n for n in names if n and n.lower() not in ("nan", "none", "<na>")]
     if names:
         out.name.setdefault(str(symbol), names[0])
 

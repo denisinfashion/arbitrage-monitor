@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from history import snapshot, store
 from history.config import SETTINGS
 from history.ui import FULL
+from history.breakdown import explain
 from history.paths import find_cycles
 from history.rates import build_grid
 
@@ -192,6 +193,16 @@ def compute(window_h: float, anchor: str, max_legs: int, trade_size: float,
         )
     except (ValueError, KeyError) as exc:
         return None, None, None, str(exc)
+    except Exception as exc:  # noqa: BLE001
+        # Ловим всё остальное намеренно. В облаке необработанное исключение
+        # показывается как «error message is redacted», и понять, что
+        # случилось, можно только через панель управления приложением.
+        # Лучше показать тип и текст прямо на странице.
+        import traceback
+        log = traceback.format_exc(limit=6)
+        return None, None, None, (
+            f"Расчёт не удался: {type(exc).__name__}: {exc}\n\n```\n{log}\n```"
+        )
     finally:
         s.staleness_sec, s.analysis_timeframe = old_stale, old_tf
     return grid, table, cycles, None
@@ -439,6 +450,104 @@ with g1:
         hovermode="x unified", showlegend=False,
     )
     st.plotly_chart(fig, **FULL)
+
+# --------------------------------------------------------------------------
+# Разбор по шагам
+# --------------------------------------------------------------------------
+
+st.subheader("Разбор обмена по шагам")
+st.caption(
+    "Сколько чего получится на каждой ноге и на какой из них создаётся маржа. "
+    "Эти же числа должен показать кошелёк перед подтверждением обмена — "
+    "если расходятся больше чем на доли процента, сделку лучше не делать."
+)
+
+b1, b2, b3 = st.columns([1, 1, 2])
+with b1:
+    amount = st.number_input("Сумма, USDT", min_value=10.0, max_value=1_000_000.0,
+                             value=float(trade_size), step=100.0,
+                             help="Проскальзывание пересчитывается под эту сумму")
+with b2:
+    moment = st.radio("Момент", ["сейчас", "лучший"], horizontal=True,
+                      help="«Сейчас» — последняя точка истории. "
+                           "«Лучший» — момент максимальной маржи за окно.")
+
+br = explain(cyc, amount=amount, prefer=moment)
+
+if br is None:
+    st.info("В выбранный момент нет полного набора курсов для этой связки.")
+else:
+    with b3:
+        st.metric(
+            f"Итог с {amount:,.0f} USDT".replace(",", " "),
+            f"{br.amount_out - br.gas_usd:,.2f} USDT".replace(",", " "),
+            f"{br.net_pct:+.3f}%  ({br.profit:+,.2f})".replace(",", " "),
+        )
+        # Часовой пояс пользователя серверу неизвестен, поэтому время
+        # показывается как «сколько назад» плюс UTC — это читается
+        # одинаково откуда угодно.
+        ago = max(0, int(time.time() - br.ts))
+        when = (f"{ago // 60} мин назад" if ago < 5400
+                else f"{ago / 3600:.1f} ч назад")
+        st.caption("Момент: " + when + " · "
+                   + pd.to_datetime(br.ts, unit="s", utc=True)
+                   .strftime("%d.%m %H:%M UTC"))
+
+    st.dataframe(
+        br.to_frame(), hide_index=True, **FULL,
+        column_config={
+            "№": st.column_config.NumberColumn("№", width="small", format="%d"),
+            "Обмен": st.column_config.TextColumn("Обмен", width="small"),
+            "Площадка": st.column_config.TextColumn("Где", width="small"),
+            "Отдаём": st.column_config.NumberColumn("Отдаём", width="small"),
+            "Курс": st.column_config.NumberColumn("Курс", width="small"),
+            "Получаем": st.column_config.NumberColumn("Получаем", width="small"),
+            "Комиссия %": st.column_config.NumberColumn(
+                "Комис.", width="small", format="%.3f",
+                help="Комиссия площадки за эту ногу"),
+            "Проскальз. %": st.column_config.NumberColumn(
+                "Проскал.", width="small", format="%.3f",
+                help="Насколько курс ухудшится от размера сделки"),
+            "Вклад %": st.column_config.NumberColumn(
+                "Вклад", width="small", format="%+.3f",
+                help="Сколько эта нога добавила или отняла от итога. "
+                     "Сумма вкладов даёт итоговую маржу."),
+            f"Стоимость, {br.anchor}": st.column_config.NumberColumn(
+                "Позиция $", width="small", format="%.2f",
+                help="Во сколько оценивается позиция после этой ноги"),
+        },
+    )
+
+    best = br.best_leg()
+    losses = [s for s in br.steps if s.pnl_pct <= 0]
+    if best is not None:
+        msg = (f"Маржа создаётся на ноге **{best.n}. {best.asset_in} → "
+               f"{best.asset_out}** ({best.venue}): **{best.pnl_pct:+.3f}%**.")
+        if losses:
+            msg += (f" Остальные {len(losses)} "
+                    + ("нога отнимает" if len(losses) == 1 else "ноги отнимают")
+                    + f" {sum(s.pnl_pct for s in losses):+.3f}% "
+                      "на комиссиях и проскальзывании.")
+        st.markdown(msg)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Комиссии площадок", f"−{br.total_fees():,.2f} USDT".replace(",", " "))
+    c2.metric("Проскальзывание", f"−{br.total_slippage():,.2f} USDT".replace(",", " "))
+    c3.metric("Газ", f"−{br.gas_usd:,.2f} USDT".replace(",", " "))
+
+    if not br.exact:
+        st.caption(
+            "Сумма отличается от той, под которую строилась таблица "
+            f"(${trade_size:,.0f}), поэтому проскальзывание пересчитано — "
+            "числа могут немного расходиться с таблицей. Это не ошибка: "
+            "именно так меняется результат от размера сделки."
+            .replace(",", " ")
+        )
+
+    st.text(br.as_text())
+    st.download_button(
+        "Скачать разбор", br.as_text().encode("utf-8-sig"),
+        file_name=f"разбор_{'_'.join(cyc.assets)}.txt", mime="text/plain")
 
 with st.expander("Данные графика"):
     st.dataframe(df, **FULL, hide_index=True)

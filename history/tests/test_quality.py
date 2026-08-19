@@ -190,6 +190,97 @@ def test_9_alert_dedup_and_ceiling():
     print("9 ok: абсурдная маржа не уходит, перестановки не дублируются")
 
 
+def test_10_pandas_na_does_not_crash():
+    """Регрессия: в облаке справочник приходит из Parquet с pd.NA.
+
+    У pd.NA нет булева значения, поэтому проверка вида `if sym and addr`
+    не возвращает False, а падает с TypeError. Локально этого не видно:
+    из SQLite приходят обычные None. Приложение сломалось ровно так.
+    """
+    import history.rates as rates
+    from history.config import SETTINGS
+    from history.rates import _denullify, build_grid
+
+    df = pd.DataFrame([
+        _pool("0xaaa", "WBNB", "USDT", REAL_WBNB, REAL_USDT, volume=9e6),
+        _pool("0xbbb", "CAKE", "WBNB", REAL_CAKE, REAL_WBNB, volume=3e6),
+    ])
+    # Имена и часть адресов отсутствуют — как у строк, записанных до
+    # появления этих колонок. convert_dtypes даёт ровно те типы,
+    # в которых pandas отдаёт Parquet.
+    df.loc[0, "base_name"] = None
+    df.loc[1, "quote_name"] = None
+    df = df.convert_dtypes()
+    assert str(df["base_name"].dtype) != "object", df.dtypes.to_dict()
+
+    # Без приведения типов — TypeError, ради которого всё и написано.
+    raised = False
+    try:
+        for r in df.to_dict("records"):
+            if r["base_name"] and r["base_addr"]:
+                pass
+    except TypeError:
+        raised = True
+    print(f"   (проверка постановки задачи: сырой pd.NA даёт TypeError = {raised})")
+
+    s = screen_pools(df)
+    assert not s.bad_pools, s.bad_pools
+
+    ts = np.arange(1_700_000_000, 1_700_000_000 + 900 * 5, 900)
+    rows = []
+    for t in ts:
+        rows.append(dict(ts=int(t), venue="pancakeswap_v3", venue_kind="dex",
+                         chain="bsc", base="WBNB", quote="USDT", close=600.0,
+                         volume=1e6, liquidity_usd=5e5, pool="0xaaa"))
+        rows.append(dict(ts=int(t), venue="pancakeswap_v3", venue_kind="dex",
+                         chain="bsc", base="CAKE", quote="WBNB",
+                         close=2.05 / 600, volume=1e6, liquidity_usd=5e5,
+                         pool="0xbbb"))
+
+    # Подменяем не _pools_frame, а источник под ним: приведение типов
+    # должно происходить в самом производственном пути, а не в тесте.
+    from history import snapshot
+    orig = snapshot.pools
+    snapshot.pools = lambda chain, min_reserve_usd=0.0: df
+    try:
+        grid = build_grid(pd.DataFrame(rows), settings=SETTINGS,
+                          venue_kinds=["dex"], drop_suspicious=True)
+        assert grid.token_address.get(("bsc", "CAKE")) == REAL_CAKE
+        assert grid.token_name.get("CAKE") == "CAKE"
+    finally:
+        snapshot.pools = orig
+    print("10 ok: пропуски из Parquet не роняют расчёт")
+
+
+def test_11_broken_directory_degrades_quietly():
+    """Сломанный справочник не должен уносить страницу целиком."""
+    import history.rates as rates
+    from history.config import SETTINGS
+    from history.rates import build_grid
+
+    class Exploding:
+        empty = False
+        columns = ["base"]
+
+        def copy(self):
+            raise RuntimeError("справочник повреждён")
+
+    ts = np.arange(1_700_000_000, 1_700_000_000 + 900 * 4, 900)
+    rows = [dict(ts=int(t), venue="pancakeswap_v3", venue_kind="dex",
+                 chain="bsc", base="WBNB", quote="USDT", close=600.0,
+                 volume=1e6, liquidity_usd=5e5, pool="0xaaa") for t in ts]
+
+    orig = rates._pools_frame
+    rates._pools_frame = lambda settings: Exploding()
+    try:
+        grid = build_grid(pd.DataFrame(rows), settings=SETTINGS,
+                          venue_kinds=["dex"], drop_suspicious=True)
+        assert "USDT" in grid.assets and "WBNB" in grid.assets
+    finally:
+        rates._pools_frame = orig
+    print("11 ok: сбой справочника не ломает расчёт")
+
+
 def run_all():
     import inspect
     mod = sys.modules[__name__]
