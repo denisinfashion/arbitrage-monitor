@@ -61,6 +61,7 @@ API = PUBLIC_API
 
 MAX_FREE_PAGES = 10      # дальше требуется платный тариф
 POOLS_PER_PAGE = 20
+MULTI_BATCH = 30         # сколько адресов пулов принимает /pools/multi
 MAX_CANDLES = 1000
 
 # ccxt-таймфрейм -> (timeframe, aggregate) в терминах GeckoTerminal
@@ -160,8 +161,12 @@ class GeckoTerminalSource:
             return n
 
         # --- 1. Топ сети ---------------------------------------------------
+        # Страниц берём меньше, чем вместил бы лимит пулов: остальное
+        # доберут топы площадок и список наблюдения, а каждая лишняя
+        # страница — это запрос из скудной квоты.
         need_pages = min(
             MAX_FREE_PAGES,
+            max(1, int(getattr(self.s, "dex_top_pages", 5))),
             max(1, -(-self.s.dex_pool_limit // POOLS_PER_PAGE)),
         )
         for page in range(1, need_pages + 1):
@@ -386,6 +391,76 @@ class GeckoTerminalSource:
             base=pool["base"], quote=pool["quote"],
             close=b / q, liquidity_usd=pool["reserve_usd"], pool=pool["pool"],
         )
+
+    # ---------------------------------------------------------------- pulse
+
+    def pulse(self) -> int:
+        """Обновляет цены уже известных пулов. Дёшево по запросам.
+
+        Разделение с discover появилось, когда в логе пошли отказы 429.
+        Полный поиск стоит около тридцати запросов: десять страниц топа
+        сети, список площадок, по запросу на площадку и по запросу на
+        каждый тикер из списка наблюдения. Лимит GeckoTerminal — тридцать
+        запросов в минуту на адрес, а адреса раннеров общие, так что
+        в лимит мы упирались уже на седьмой странице.
+
+        Но для живого среза ничего искать не надо: набор пулов известен,
+        нужны только свежие цены. Эндпоинт multi принимает до тридцати
+        адресов за раз, поэтому сотня пулов обходится четырьмя запросами
+        вместо тридцати. Из этого следует и главное: срезы можно снимать
+        часто, не рискуя квотой.
+        """
+        pools = self.pools
+        if not pools:
+            return self.discover()
+
+        now = int(time.time())
+        tf_sec = self.s.timeframe_seconds()
+        bucket = now - (now % tf_sec)
+        by_addr = {p["pool"]: p for p in pools}
+        addrs = list(by_addr)
+
+        candles: List[Candle] = []
+        fresh: List[dict] = []
+        refused = 0
+        for i in range(0, len(addrs), MULTI_BATCH):
+            batch = addrs[i:i + MULTI_BATCH]
+            try:
+                payload = get_json(
+                    f"{self.api}/networks/{self.chain}/pools/multi/"
+                    + ",".join(batch),
+                    params={"include": "base_token,quote_token,dex"},
+                    headers=self.headers,
+                )
+            except HttpError as exc:
+                refused += 1
+                log.warning("живой срез, пачка %d: %s", i // MULTI_BATCH + 1, exc)
+                continue
+            tokens = self._index_included(payload.get("included", []))
+            for item in payload.get("data", []) or []:
+                parsed = self._parse_pool(item, tokens)
+                if parsed is None:
+                    continue
+                fresh.append(parsed)
+                snap = self._live_candle(parsed, bucket)
+                if snap:
+                    candles.append(snap)
+
+        if fresh:
+            write_pools(fresh)
+            # Резервы и обороты меняются — держим справочник в актуальном виде,
+            # иначе проскальзывание считалось бы по устаревшей глубине.
+            known = {p["pool"]: p for p in self._pools}
+            known.update({p["pool"]: p for p in fresh})
+            self._pools = list(known.values())
+
+        written = write_candles(candles)
+        set_state(self.name, "pulse", ok=bool(written), rows=written,
+                  error="" if written else "срез пуст")
+        log.info("%s: живой срез — %d котировок по %d пулам%s",
+                 self.name, written, len(addrs),
+                 f", отказов {refused}" if refused else "")
+        return written
 
     # ------------------------------------------------------------ pool list
 

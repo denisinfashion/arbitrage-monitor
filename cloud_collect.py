@@ -168,6 +168,10 @@ def main(argv=None) -> int:
     env_venues = os.environ.get("ARB_CEX_VENUES", "").strip()
     if env_venues:
         SETTINGS.cex_venues = [v.strip() for v in env_venues.split(",") if v.strip()]
+    env_syms = os.environ.get("ARB_CEX_SYMBOL_LIMIT", "").strip()
+    if env_syms.isdigit():
+        SETTINGS.cex_symbol_limit = int(env_syms)
+
     sha = os.environ.get("GITHUB_SHA", "")
     log.info("версия кода: %s | коммит: %s | событие: %s",
              CODE_VERSION, sha[:7] or "локальный",
@@ -196,7 +200,10 @@ def main(argv=None) -> int:
     # DEX идёт первым: он дешевле по времени и именно ради него всё затевалось.
     # Один вызов discover сразу даёт свежие цены всех наблюдаемых пулов.
     if c.dex:
-        run_bounded("DEX discover", c.dex.discover, min(120.0, left()))
+        # Полный поиск дорог по запросам, поэтому делается один раз
+        # за прогон и с запасом по времени: при отказах 429 источник
+        # выжидает, и в две минуты поиск переставал укладываться.
+        run_bounded("DEX discover", c.dex.discover, min(240.0, left()))
 
     # Биржи: discover каждой ограничен, чтобы недоступная площадка
     # не съела прогон целиком.
@@ -237,10 +244,14 @@ def main(argv=None) -> int:
             if left() <= 30:
                 log.warning("время вышло, биржи собраны не полностью")
                 return
-            # Остаток делится между оставшимися, но не меньше минуты:
-            # фиксированные 180 с раньше означали, что первая биржа могла
-            # съесть всё, а последняя не получала ничего.
-            share = max(60.0, left() / max(1, len(alive) - i))
+            # Каждой бирже отдаётся всё оставшееся время за вычетом
+            # минимального запаса для тех, кто ещё не отработал. Деление
+            # поровну выглядело справедливым, но на десяти площадках
+            # давало по 66 секунд каждой, и htx с bitfinex срезались
+            # ровно на подходе — при том что следующие за ними
+            # укладывались в двадцать секунд и остаток пропадал.
+            reserve = 45.0 * max(0, len(alive) - i - 1)
+            share = max(60.0, min(240.0, left() - reserve))
             fn = src.update if before["rows"] else src.backfill
             n = run_bounded(f"CEX {src.name} сбор", fn, min(share, left()))
             log.info("CEX %s: +%d свечей", src.name, n)
@@ -259,7 +270,9 @@ def main(argv=None) -> int:
     while c.dex and time.time() < deadline - 10:
         now = time.time()
         if now >= next_pulse:
-            run_bounded("DEX срез", c.dex.discover, min(90.0, deadline - now))
+            # Срез, а не поиск: цены уже известных пулов обходятся
+            # четырьмя запросами вместо тридцати.
+            run_bounded("DEX срез", c.dex.pulse, min(90.0, deadline - now))
             pulses += 1
             next_pulse = time.time() + pulse
             continue

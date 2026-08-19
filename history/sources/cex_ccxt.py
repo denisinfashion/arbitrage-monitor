@@ -89,7 +89,12 @@ class CexSource:
             candidates = self._drop_leveraged(candidates)
 
         ranked = self._rank_by_volume(candidates)
-        self._symbols = ranked[: self.s.cex_symbol_limit]
+        # У части площадок квота не выдерживает общего потолка:
+        # Bitfinex на 79 парах отдавал 54 отказа из-за лимита.
+        from ..config import CEX_SYMBOL_LIMITS
+        cap = min(self.s.cex_symbol_limit,
+                  CEX_SYMBOL_LIMITS.get(self.name, self.s.cex_symbol_limit))
+        self._symbols = ranked[:cap]
         log.info("%s: отобрано %d пар", self.name, len(self._symbols))
         return len(self._symbols)
 

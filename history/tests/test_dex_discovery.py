@@ -36,6 +36,9 @@ TOKENS = {
     "AAVE": ("0xfb6115445bff7b52feb98650c87f44907e58f802", "Aave Token"),
     "DAI":  ("0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3", "Dai Token"),
 }
+# После norm_asset обёртка приводится к базовому тикеру, и в справочнике
+# пулов лежит уже BNB, а не WBNB — срез спрашивает цены по этим записям.
+TOKENS["BNB"] = TOKENS["WBNB"]
 
 
 def _tok_obj(sym):
@@ -72,6 +75,9 @@ def _payload(items):
                 if ref.endswith(a):
                     syms.add(s)
     return {"data": items, "included": [_tok_obj(s) for s in sorted(syms)]}
+
+
+MULTI: dict = {}
 
 
 def main() -> int:
@@ -118,6 +124,16 @@ def main() -> int:
                            reserve=8e5 - i * 1000, volume=3e5, base_usd=2.05)
                 for i in range(5)
             ])
+
+        # Живой срез: цены известных пулов пачками по адресам.
+        if "/pools/multi/" in url:
+            addrs = url.rsplit("/pools/multi/", 1)[1].split(",")
+            known = {a: d for a, d in MULTI.items()}
+            items = [_pool_item(a, known[a][0], known[a][1], known[a][2],
+                                reserve=known[a][3], volume=known[a][4],
+                                base_usd=known[a][5])
+                     for a in addrs if a in known]
+            return _payload(items)
 
         # Список наблюдения.
         if url.endswith("/search/pools"):
@@ -192,7 +208,25 @@ def main() -> int:
           sum(1 for u in calls if u.endswith("/search/pools")) == len(expected),
           f"{len(expected)} тикеров: {', '.join(expected)}")
 
-    print("\n4. Живые цены записаны")
+    print("\n4. Живой срез дешевле полного поиска")
+    # Полный поиск стоит десятки запросов: страницы топа, список площадок,
+    # запрос на площадку и на каждый тикер наблюдения. На бесплатной квоте
+    # в тридцать запросов в минуту этого хватало, чтобы упереться в 429
+    # прямо посреди поиска. Срез спрашивает только цены известных пулов.
+    for p in pools:
+        MULTI[p["pool"]] = (p["dex"], p["base"], p["quote"],
+                            p["reserve_usd"], p["volume_24h"], 1.0)
+    calls.clear()
+    written = src.pulse()
+    multi_calls = sum(1 for u in calls if "/pools/multi/" in u)
+    check("срез записал котировки", written > 0, f"{written}")
+    check("запросов немного", len(calls) <= 6,
+          f"{len(calls)} запросов на {len(pools)} пулов")
+    check("использован эндпоинт multi", multi_calls == len(calls), f"{multi_calls}")
+    check("поиск при срезе не выполнялся",
+          not any("/search/pools" in u or "/dexes" in u for u in calls))
+
+    print("\n5. Живые цены записаны")
     st = store.stats()
     check("свечи появились", st["rows"] > 0, f"{st['rows']} строк")
     check("площадок в базе больше одной", st["venues"] > 1, f"{st['venues']}")
