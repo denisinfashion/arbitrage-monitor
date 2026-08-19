@@ -31,7 +31,7 @@ import numpy as np
 import pandas as pd
 
 from .config import (CEX_TAKER_PCT, DEX_POOL_FEE_PCT, SETTINGS, USD_LIKE,
-                     is_leveraged_token)
+                     dex_fee_pct, is_leveraged_token)
 
 log = logging.getLogger(__name__)
 
@@ -167,7 +167,7 @@ def venue_fee_pct(venue: str, venue_kind: str, pool_fee: Optional[float] = None)
         return CEX_TAKER_PCT.get(venue, 0.10)
     if pool_fee is not None and pool_fee > 0:
         return float(pool_fee)
-    return DEX_POOL_FEE_PCT.get(venue, DEX_POOL_FEE_PCT["default"])
+    return dex_fee_pct(venue)
 
 
 # --------------------------------------------------------------------------

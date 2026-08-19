@@ -93,16 +93,23 @@ def main() -> int:
             if page > 2:
                 return {"data": [], "included": []}
             items = [
-                _pool_item(f"0xtop{page}{i}", "pancakeswap_v3", "WBNB", "USDT",
+                _pool_item(f"0xtop{page}{i}", "pancakeswap-v3-bsc", "WBNB", "USDT",
                            reserve=9e6 - i, volume=5e6, base_usd=600.0)
                 for i in range(20)
             ]
             return _payload(items)
 
+        # Список площадок сети. Идентификаторы намеренно в том виде,
+        # в каком их отдаёт источник: с дефисами и суффиксом сети.
+        if url.endswith("/networks/bsc/dexes"):
+            return {"data": [{"id": f"bsc_{d}"} for d in
+                             ("pancakeswap-v3-bsc", "uniswap-bsc",
+                              "biswap", "thena", "sushiswap-bsc")]}
+
         # Топ отдельной площадки.
         if "/dexes/" in url:
             dex = url.rsplit("/dexes/", 1)[1].split("/")[0]
-            if dex in ("uniswap_v2", "sushiswap"):
+            if dex in ("sushiswap-bsc",):
                 # площадки нет в этой сети
                 from history.http import HttpError
                 raise HttpError(f"{dex}: 404")
@@ -129,7 +136,7 @@ def main() -> int:
     s = Settings()
     s.dex_pool_limit = 30
     s.dex_venue_quota = 8
-    s.dex_venues = ["pancakeswap_v3", "uniswap_v2", "biswap", "thena", "sushiswap"]
+    s.dex_venues = []          # определяем автоматически
     s.watch_tokens = ["AAVE", "DAI"]
     s.min_pool_reserve_usd = 100_000
 
@@ -146,20 +153,30 @@ def main() -> int:
     check("площадок больше одной", len(by_dex) > 1, ", ".join(
         f"{d}:{c}" for d, c in sorted(by_dex.items())))
     check("недоступная площадка не роняет сбор",
-          "uniswap_v2" not in by_dex and len(by_dex) >= 3)
+          "sushiswap-bsc" not in by_dex and len(by_dex) >= 3)
 
     print("\n2. Квота на площадку")
     # Квота — это гарантированный минимум, а не потолок: остаток лимита
     # честно достаётся самым крупным пулам, где бы они ни были. Иначе
     # ради разнообразия выбрасывались бы как раз самые исполнимые пары.
-    available = {"pancakeswap_v3": 40, "biswap": 5, "thena": 5 + 2}
+    available = {"pancakeswap-v3-bsc": 40, "biswap": 5, "thena": 5 + 2}
     short = {d: (by_dex.get(d, 0), min(s.dex_venue_quota, k))
              for d, k in available.items()
              if by_dex.get(d, 0) < min(s.dex_venue_quota, k)}
     check("каждая площадка получила свою квоту", not short, str(short) if short else "")
-    share = by_dex.get("pancakeswap_v3", 0) / max(1, len(pools))
+    share = by_dex.get("pancakeswap-v3-bsc", 0) / max(1, len(pools))
     check("PancakeSwap не забрал весь список", share < 0.8,
-          f"{by_dex.get('pancakeswap_v3', 0)} из {len(pools)} ({share:.0%})")
+          f"{by_dex.get('pancakeswap-v3-bsc', 0)} из {len(pools)} ({share:.0%})")
+
+    print("\n2б. Идентификаторы площадок и комиссии")
+    from history.config import dex_fee_pct
+    check("идентификаторы взяты у источника, а не из настроек",
+          any("-bsc" in d for d in by_dex), ", ".join(sorted(by_dex)))
+    check("комиссия PancakeSwap распознана", dex_fee_pct("pancakeswap-v3-bsc") == 0.25)
+    check("комиссия Uniswap распознана", dex_fee_pct("uniswap-bsc") == 0.30)
+    check("комиссия Biswap распознана", dex_fee_pct("biswap") == 0.10)
+    check("незнакомая площадка получает умолчание",
+          dex_fee_pct("dinosaureggs") == 0.25)
 
     print("\n3. Список наблюдения")
     syms = {p["base"] for p in pools} | {p["quote"] for p in pools}

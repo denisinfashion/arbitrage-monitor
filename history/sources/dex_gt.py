@@ -27,8 +27,8 @@ import logging
 import time
 from typing import Dict, List, Optional, Tuple
 
-from ..config import (DEX_POOL_FEE_PCT, SETTINGS, load_watchlist,
-                      norm_asset)
+from ..config import (DEX_POOL_FEE_PCT, SETTINGS, dex_fee_pct,
+                      load_watchlist, norm_asset)
 from ..http import HttpError, get_json
 from ..store import Candle, get_last_ts, set_state, write_candles, write_pools
 
@@ -180,7 +180,7 @@ class GeckoTerminalSource:
                 break
 
         # --- 2. Топ каждой площадки ----------------------------------------
-        for dex in self.s.dex_venues or []:
+        for dex in self._venue_ids():
             try:
                 payload = get_json(
                     f"{self.api}/networks/{self.chain}/dexes/{dex}/pools",
@@ -254,6 +254,37 @@ class GeckoTerminalSource:
                  "площадок %d (%s)", self.name, len(pools), written, len(by_dex),
                  ", ".join(f"{d}:{n}" for d, n in top))
         return len(pools)
+
+    def _venue_ids(self) -> List[str]:
+        """Идентификаторы площадок сети: из настроек или у источника.
+
+        Записанный вручную список не совпадал с реальными
+        идентификаторами (`pancakeswap_v3` против `pancakeswap-v3-bsc`),
+        и запросы уходили в никуда — молча, потому что отсутствие
+        площадки в сети не считается ошибкой. Спросить список у самого
+        источника надёжнее: один запрос, и совпадение гарантировано.
+        """
+        if self.s.dex_venues:
+            return list(self.s.dex_venues)
+        try:
+            payload = get_json(f"{self.api}/networks/{self.chain}/dexes",
+                               headers=self.headers)
+        except HttpError as exc:
+            log.warning("список площадок недоступен: %s", exc)
+            return []
+        # Идентификатор приходит как `bsc_pancakeswap-v3` либо просто
+        # `pancakeswap-v3` — эндпоинт пулов принимает вариант без сети.
+        clean = []
+        for item in payload.get("data", []) or []:
+            i = str(item.get("id", ""))
+            if i.startswith(self.chain + "_"):
+                i = i[len(self.chain) + 1:]
+            if i:
+                clean.append(i)
+        limit = max(1, int(getattr(self.s, "dex_venue_pages", 12)))
+        log.info("%s: площадок в сети %d, опрашиваем %d",
+                 self.name, len(clean), min(limit, len(clean)))
+        return clean[:limit]
 
     def _apply_venue_quota(self, pools: List[dict],
                            protected: Optional[set] = None) -> List[dict]:
@@ -339,7 +370,7 @@ class GeckoTerminalSource:
             "quote_name": quote_name,
             "reserve_usd": _f(attrs.get("reserve_in_usd")),
             "volume_24h": _f((attrs.get("volume_usd") or {}).get("h24")),
-            "fee_pct": DEX_POOL_FEE_PCT.get(dex_id, DEX_POOL_FEE_PCT["default"]),
+            "fee_pct": dex_fee_pct(dex_id),
             # не пишется в таблицу pools, используется ниже
             "_base_usd": _f(attrs.get("base_token_price_usd")),
             "_quote_usd": _f(attrs.get("quote_token_price_usd")),

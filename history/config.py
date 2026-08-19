@@ -55,11 +55,18 @@ class Settings:
     арбитража теряется: разница цен возникает как раз между площадками.
     """
 
-    dex_venues: List[str] = field(default_factory=lambda: [
-        "pancakeswap_v3", "pancakeswap_v2", "uniswap_v3", "uniswap_v2",
-        "biswap", "thena", "sushiswap", "apeswap",
-    ])
-    """Площадки, у которых берём топ пулов отдельно от общего топа сети."""
+    dex_venues: List[str] = field(default_factory=list)
+    """Площадки, у которых берём топ пулов отдельно от общего топа сети.
+
+    Пусто — определять автоматически, запросив список площадок сети.
+    Так и надо: идентификаторы у источника непредсказуемы
+    (`pancakeswap-v3-bsc`, `uniswap-bsc`, `apeswap_bsc`), и записанный
+    вручную список молча не совпадал ни с чем — запросы уходили в никуда,
+    а разнообразия площадок как не было, так и не появлялось.
+    """
+
+    dex_venue_pages: int = 12
+    """Сколько площадок сети опрашивать при автоопределении."""
 
     watch_tokens: List[str] = field(default_factory=list)
     """Токены, пулы которых добираются принудительно, по тикеру.
@@ -231,7 +238,7 @@ def load_watchlist(settings=None) -> List[str]:
     return out
 
 
-CODE_VERSION = "2026-08-19.5"
+CODE_VERSION = "2026-08-19.6"
 """Отметка версии модулей.
 
 Нужна из-за реального случая: при распаковке обновления поверх папки
@@ -274,11 +281,52 @@ DEX_POOL_FEE_PCT = {
     "biswap": 0.10,
     "thena": 0.20,
     "sushiswap": 0.30,
-    "sushiswap_v2": 0.30,
-    "sushiswap_v3": 0.30,
     "apeswap": 0.20,
+    "babyswap": 0.20,
+    "squadswap": 0.25,
+    # Семейства без указания версии — на случай, когда в идентификаторе
+    # площадки версии нет вовсе.
+    "pancakeswap": 0.25,
+    "uniswap": 0.30,
     "default": 0.25,
 }
+
+
+def normalize_dex(dex_id: str) -> str:
+    """Приводит идентификатор площадки к виду, по которому ищется комиссия.
+
+    Источник отдаёт идентификаторы вида `pancakeswap-v3-bsc`, `uniswap-bsc`,
+    `apeswap_bsc`, `pancakeswap_v2` — вперемешку с дефисами, подчёркиваниями
+    и суффиксом сети. Наши таблицы комиссий были записаны в одном стиле,
+    и почти все реальные площадки в них не попадали: комиссия молча
+    бралась из `default`, то есть у Uniswap считалась заниженной,
+    у Biswap — завышенной вдвое.
+    """
+    v = (dex_id or "").strip().lower().replace("-", "_")
+    for suffix in ("_bsc", "_eth", "_ethereum", "_arbitrum", "_polygon",
+                   "_base", "_avax", "_optimism"):
+        if v.endswith(suffix):
+            v = v[: -len(suffix)]
+    return v
+
+
+def dex_fee_pct(dex_id: str) -> float:
+    """Комиссия пула в процентах по идентификатору площадки.
+
+    Ищет от точного совпадения к семейству: `pancakeswap_v3_bsc` ->
+    `pancakeswap_v3` -> `pancakeswap`. Так новая версия знакомой площадки
+    получает разумное значение, а не общее умолчание.
+    """
+    v = normalize_dex(dex_id)
+    if v in DEX_POOL_FEE_PCT:
+        return DEX_POOL_FEE_PCT[v]
+    parts = v.split("_")
+    while len(parts) > 1:
+        parts.pop()
+        candidate = "_".join(parts)
+        if candidate in DEX_POOL_FEE_PCT:
+            return DEX_POOL_FEE_PCT[candidate]
+    return DEX_POOL_FEE_PCT["default"]
 
 
 # --------------------------------------------------------------------------

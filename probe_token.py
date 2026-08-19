@@ -112,34 +112,57 @@ def probe(ticker: str, chain: str) -> int:
     floor = (SETTINGS.watch_min_reserve_usd if in_watch
              else SETTINGS.min_pool_reserve_usd)
 
-    try:
-        from history.quality import MIN_POOL_VOLUME_USD as vol_floor
-    except ImportError:
-        vol_floor = 0.0
+    # Вердикт выносит та же функция, что и в расчёте. Своя копия правил
+    # здесь однажды уже разошлась с производственной — проверка показывала
+    # одно, сборщик делал другое.
+    from history.quality import (MIN_POOL_TURNOVER, MIN_POOL_VOLUME_USD,
+                                 screen_pools)
+    import pandas as pd
+
+    frame = pd.DataFrame([{
+        "chain": chain, "pool": p["pool"], "dex": p["dex"],
+        "base": p["base"], "quote": p["quote"],
+        "base_addr": p["base_addr"], "quote_addr": p["quote_addr"],
+        "base_name": "", "quote_name": "",
+        "reserve_usd": p["reserve"], "volume_24h": p["volume"],
+    } for p in pools])
+    screen = screen_pools(frame)
 
     print(f"в списке наблюдения: {'да' if in_watch else 'нет'} · "
-          f"порог ликвидности {money(floor)} · порог оборота {money(vol_floor)}")
-    print(f"\n{'пара':<22}{'площадка':<20}{'ликвидность':>14}"
-          f"{'оборот 24ч':>14}  вердикт")
-    print("-" * 88)
+          f"порог ликвидности {money(floor)} · оборот от {money(MIN_POOL_VOLUME_USD)} "
+          f"и не ниже {MIN_POOL_TURNOVER * 100:.0f}% от резерва")
+    print(f"\n{'пара':<22}{'площадка':<20}{'ликвидность':>13}"
+          f"{'оборот 24ч':>13}{'оборачив.':>11}  вердикт")
+    print("-" * 100)
 
     pools.sort(key=lambda p: p["reserve"] or 0, reverse=True)
     partners, passed = set(), 0
     for p in pools:
         why = []
         if (p["reserve"] or 0) < floor:
-            why.append("мал резерв")
-        if vol_floor and p["volume"] is not None and p["volume"] < vol_floor:
-            why.append("нет оборота")
+            why.append("мал резерв для сбора")
+        if p["pool"] in screen.bad_pools:
+            why.append("отсеян проверкой качества")
         ok = not why
         if ok:
             passed += 1
             other = p["quote"] if p["base"] == want else p["base"]
             partners.add(other)
+        turn = ((p["volume"] or 0) / p["reserve"] * 100) if p["reserve"] else 0
         pair = f"{p['base']} / {p['quote']}"
-        print(f"{pair:<22}{p['dex']:<20}{money(p['reserve']):>14}"
-              f"{money(p['volume']):>14}  "
+        print(f"{pair:<22}{p['dex']:<20}{money(p['reserve']):>13}"
+              f"{money(p['volume']):>13}{turn:>10.1f}%  "
               f"{'берём' if ok else 'мимо: ' + ', '.join(why)}")
+
+    if screen.address.get(want):
+        addrs = {p["base_addr"] if p["base"] == want else p["quote_addr"]
+                 for p in pools if want in (p["base"], p["quote"])}
+        addrs = {a for a in addrs if a}
+        if len(addrs) > 1:
+            print(f"\nВнимание: тикер {want} встречается с {len(addrs)} разными "
+                  f"контрактами. Настоящим признан {screen.address[want]}, "
+                  "пулы остальных отброшены — это разные токены, "
+                  "и «разница цен» между ними неисполнима.")
 
     print(f"\nпулов всего {len(pools)}, проходит фильтры {passed}")
     if partners:
