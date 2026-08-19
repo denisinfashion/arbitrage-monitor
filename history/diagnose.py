@@ -89,6 +89,8 @@ class ChainReport:
     stage: str = ""
     """Короткий код шага, на котором связка выпала."""
     missing: List[str] = field(default_factory=list)
+    routed: List[str] = field(default_factory=list)
+    """Плечи, раскрытые через промежуточный актив: «AAVE → DAI через BNB»."""
     quotes_seen: int = 0
 
     @property
@@ -114,47 +116,165 @@ def parse_chain(text: str, anchor: str = "USDT") -> List[str]:
     return parts
 
 
-def _best_row(quotes: pd.DataFrame, a: str, b: str) -> Optional[pd.Series]:
-    """Самая свежая котировка пары в любую сторону, приведённая к a -> b.
+# Через что маршрутизатор обычно ведёт обмен, когда прямого пула нет.
+# Порядок не случаен: в BNB Chain почти всё котируется против обёрнутого
+# BNB, дальше идут стейблы, дальше крупные монеты.
+INTERMEDIATES = ["BNB", "USDT", "USDC", "ETH", "BTC", "CAKE"]
 
-    Направление не важно: цена пары обратима, и хранить обе стороны
-    было бы удвоением данных. Важно только не перепутать её при развороте.
+
+def _rows_for(quotes: pd.DataFrame, a: str, b: str) -> pd.DataFrame:
+    """Все котировки пары, приведённые к направлению a -> b.
+
+    Направление хранения не важно: цена пары обратима. Важно не
+    перепутать её при развороте — отсюда отдельная колонка `_rate`.
     """
-    fwd = quotes[(quotes["base"] == a) & (quotes["quote"] == b)]
-    bwd = quotes[(quotes["base"] == b) & (quotes["quote"] == a)]
-    if fwd.empty and bwd.empty:
+    fwd = quotes[(quotes["base"] == a) & (quotes["quote"] == b)].copy()
+    bwd = quotes[(quotes["base"] == b) & (quotes["quote"] == a)].copy()
+    if not fwd.empty:
+        fwd["_rate"] = pd.to_numeric(fwd["close"], errors="coerce")
+    if not bwd.empty:
+        price = pd.to_numeric(bwd["close"], errors="coerce")
+        bwd["_rate"] = 1.0 / price.where(price > 0)
+    parts = [f for f in (fwd, bwd) if not f.empty]
+    if not parts:
+        return fwd
+    out = pd.concat(parts, ignore_index=True)
+    if out.empty:
+        return out
+    return out[out["_rate"].notna() & (out["_rate"] > 0)]
+
+
+def _leg_cost(row, a: str, b: str, trade_usd: float, settings) -> tuple:
+    """Комиссия и проскальзывание одной котировки. Возвращает (fee_pct, slip)."""
+    kind = str(row.get("venue_kind", ""))
+    venue = str(row.get("venue", ""))
+    if kind == "dex":
+        liq = row.get("liquidity_usd")
+        liq = float(liq) if liq == liq and liq is not None else None
+        return (dex_fee_pct(venue),
+                dex_slippage_factor(trade_usd, liq, venue=venue, base=a,
+                                    quote=b, settings=settings))
+    from .config import CEX_TAKER_PCT
+    vol, price = row.get("volume"), row.get("close")
+    vol_usd = (float(vol) * float(price)
+               if vol == vol and vol is not None and price == price else None)
+    return CEX_TAKER_PCT.get(venue, 0.10), cex_slippage_factor(trade_usd, vol_usd)
+
+
+def _best_row(quotes: pd.DataFrame, a: str, b: str, trade_usd: float = 1000.0,
+              settings=SETTINGS, max_age: Optional[float] = None):
+    """Лучшая исполнимая котировка пары, а не просто самая свежая.
+
+    Сперва здесь бралась последняя по времени строка. Это оказалось
+    неверно вдвойне. Во-первых, «последняя» могла прийти с биржи, хотя
+    рядом лежал пул той же пары — и разбор показывал плечо на KuCoin
+    в цепочке, которую человек исполняет в одном блоке на DEX.
+    Во-вторых, среди нескольких площадок выгодна не свежайшая,
+    а та, где после комиссии и проскальзывания получишь больше.
+
+    Поэтому: отбрасываем протухшее, остальное сравниваем по чистому
+    курсу — ровно так же, как это делает основной расчёт.
+    """
+    rows = _rows_for(quotes, a, b)
+    if rows.empty:
         return None
 
-    rows = []
-    if not fwd.empty:
-        r = fwd.sort_values("ts").iloc[-1].copy()
-        r["_rate"] = float(r["close"])
-        rows.append(r)
-    if not bwd.empty:
-        r = bwd.sort_values("ts").iloc[-1].copy()
-        price = float(r["close"])
-        r["_rate"] = 1.0 / price if price > 0 else 0.0
-        rows.append(r)
-    rows.sort(key=lambda r: int(r["ts"]))
-    best = rows[-1]
-    best["_alternatives"] = len(fwd) + len(bwd)
+    now = time.time()
+    if max_age:
+        fresh = rows[rows["ts"] >= now - max_age]
+        if not fresh.empty:
+            rows = fresh
+
+    best, best_net = None, -1.0
+    for _, r in rows.iterrows():
+        fee_pct, slip = _leg_cost(r, a, b, trade_usd, settings)
+        net = float(r["_rate"]) * (1.0 - fee_pct / 100.0) * slip
+        if net > best_net:
+            best, best_net = r.copy(), net
+    if best is None:
+        return None
+    best["_alternatives"] = len(rows)
     return best
 
 
+def expand_route(chain: List[str], quotes: pd.DataFrame,
+                 trade_usd: float = 1000.0, settings=SETTINGS) -> tuple:
+    """Достраивает промежуточные активы там, где прямого рынка нет.
+
+    Человек говорит «USDT → AAVE → DAI → USDT», потому что именно так
+    он это и вводит в интерфейсе биржи. Но маршрутизатор внутри почти
+    никогда не делает один обмен: прямого пула AAVE/DAI может не
+    существовать вовсе, и своп идёт через обёрнутый BNB — AAVE → WBNB,
+    WBNB → DAI. Для кошелька это одна операция, для нас — две ноги
+    с двумя комиссиями.
+
+    Раньше разбор писал по такому плечу «нет котировок в окне» и на этом
+    останавливался. Формально верно, по существу — нет: рынок есть,
+    просто составной. Здесь плечо раскрывается в два, и обе комиссии
+    честно попадают в расчёт.
+    """
+    if not chain:
+        return chain, []
+    out, routed = [chain[0]], []
+    for a, b in zip(chain, chain[1:]):
+        if _best_row(quotes, a, b, trade_usd, settings) is not None:
+            out.append(b)
+            continue
+        best_mid, best_net = None, -1.0
+        for m in INTERMEDIATES:
+            if m in (a, b):
+                continue
+            first = _best_row(quotes, a, m, trade_usd, settings)
+            second = _best_row(quotes, m, b, trade_usd, settings)
+            if first is None or second is None:
+                continue
+            net = 1.0
+            for row, x, y in ((first, a, m), (second, m, b)):
+                fee_pct, slip = _leg_cost(row, x, y, trade_usd, settings)
+                net *= float(row["_rate"]) * (1.0 - fee_pct / 100.0) * slip
+            if net > best_net:
+                best_mid, best_net = m, net
+        if best_mid:
+            out.extend([best_mid, b])
+            routed.append(f"{a} → {b} через {best_mid}")
+        else:
+            out.append(b)
+    return out, routed
+
+
 def diagnose(chain: List[str], quotes: pd.DataFrame, trade_usd: float = 1000.0,
-             window_h: float = 6.0, settings=SETTINGS) -> ChainReport:
-    """Проходит связку плечо за плечом и объясняет результат."""
+             window_h: float = 6.0, settings=SETTINGS,
+             venue_kinds: Optional[List[str]] = None,
+             route: bool = True) -> ChainReport:
+    """Проходит связку плечо за плечом и объясняет результат.
+
+    `venue_kinds` ограничивает площадки. Это не украшение: связка,
+    исполняемая в одном блоке на DEX, и связка с переводом на биржу —
+    разные вещи с разным риском, и смешивать их в одном разборе значит
+    показывать несуществующий маршрут.
+
+    `route` разрешает раскрывать плечо через промежуточный актив, когда
+    прямого рынка нет.
+    """
+    if venue_kinds and not quotes.empty and "venue_kind" in quotes.columns:
+        quotes = quotes[quotes["venue_kind"].isin(list(venue_kinds))]
+
     rep = ChainReport(tickers=list(chain), trade_usd=trade_usd,
                       window_h=window_h, quotes_seen=len(quotes))
     if len(chain) < 3:
         rep.stage, rep.verdict = "input", "Нужно хотя бы два перехода."
         return rep
 
+    if route and not quotes.empty:
+        chain, rep.routed = expand_route(chain, quotes, trade_usd, settings)
+        rep.tickers = list(chain)
+
     product = 1.0
     net_product = 1.0
     for a, b in zip(chain, chain[1:]):
         leg = LegReport(frm=a, to=b)
-        row = _best_row(quotes, a, b) if not quotes.empty else None
+        row = (_best_row(quotes, a, b, trade_usd, settings)
+               if not quotes.empty else None)
         if row is None:
             leg.note = "нет котировок в окне"
             rep.legs.append(leg)
@@ -168,6 +288,8 @@ def diagnose(chain: List[str], quotes: pd.DataFrame, trade_usd: float = 1000.0,
         leg.ts = int(row["ts"])
         leg.pool = str(row.get("pool") or "")
         leg.alternatives = int(row.get("_alternatives", 1))
+        if any(f"через {a}" in r or f"через {b}" in r for r in rep.routed):
+            leg.note = "плечо раскрыто: прямого рынка нет"
 
         liq = row.get("liquidity_usd")
         leg.liquidity_usd = float(liq) if liq == liq and liq is not None else None

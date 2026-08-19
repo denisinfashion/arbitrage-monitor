@@ -246,6 +246,60 @@ def main() -> int:
     rep5 = dg.diagnose(chain, q5, trade_usd=1_000)
     check("отрицательный спот назван прямо", rep5.stage == "no_spot", rep5.stage)
 
+    print("\n7. Плечо без прямого рынка раскрывается через посредника")
+
+    # Прямого пула AAVE/DAI нет — как и в жизни. Есть AAVE/WBNB и DAI/WBNB,
+    # и маршрутизатор ведёт обмен через них. Раньше разбор писал по этому
+    # плечу «нет котировок» и останавливался.
+    q6 = pd.DataFrame([
+        {"ts": now, "venue": "pancakeswap-v3-bsc", "venue_kind": "dex",
+         "chain": "bsc", "base": "USDT", "quote": "AAVE", "close": 1 / 250.0,
+         "volume": None, "liquidity_usd": 300_000.0, "pool": "0x1"},
+        {"ts": now, "venue": "pancakeswap-v3-bsc", "venue_kind": "dex",
+         "chain": "bsc", "base": "AAVE", "quote": "BNB", "close": 0.4,
+         "volume": None, "liquidity_usd": 400_000.0, "pool": "0x2"},
+        {"ts": now, "venue": "uniswap-v3-bsc", "venue_kind": "dex",
+         "chain": "bsc", "base": "BNB", "quote": "DAI", "close": 640.0,
+         "volume": None, "liquidity_usd": 800_000.0, "pool": "0x3"},
+        {"ts": now, "venue": "pancakeswap-v3-bsc", "venue_kind": "dex",
+         "chain": "bsc", "base": "DAI", "quote": "USDT", "close": 1.0,
+         "volume": None, "liquidity_usd": 900_000.0, "pool": "0x4"},
+    ])
+    rep6 = dg.diagnose(chain, q6, trade_usd=1_000)
+    check("маршрут раскрыт", rep6.routed == ["AAVE → DAI через BNB"],
+          str(rep6.routed))
+    check("плечей стало четыре", len(rep6.legs) == 4, str(len(rep6.legs)))
+    check("цепочка достроена",
+          rep6.tickers == ["USDT", "AAVE", "BNB", "DAI", "USDT"],
+          " → ".join(rep6.tickers))
+    # 0.25 + 0.25 на Pancake, 0.30 на Uniswap, 0.25 обратно: раскрытие
+    # плеча стоит лишней комиссии, и она обязана быть видна.
+    check("комиссия лишнего плеча учтена", abs(rep6.fees_pct - 1.05) < 1e-9,
+          f"{rep6.fees_pct:.2f}% против 0.80% у прямого маршрута")
+    check("пропавших плеч нет", not rep6.missing, str(rep6.missing))
+
+    off = dg.diagnose(chain, q6, trade_usd=1_000, route=False)
+    check("без раскрытия плечо теряется", off.stage == "no_quotes", off.stage)
+
+    print("\n8. Биржи и DEX не смешиваются в одной связке")
+
+    q7 = pd.concat([q6, pd.DataFrame([{
+        "ts": now, "venue": "kucoin", "venue_kind": "cex", "chain": "",
+        "base": "AAVE", "quote": "DAI", "close": 255.0, "volume": 100.0,
+        "liquidity_usd": None, "pool": None,
+    }])], ignore_index=True)
+    only_dex = dg.diagnose(chain, q7, trade_usd=1_000, venue_kinds=["dex"])
+    check("биржевое плечо отфильтровано",
+          all(l.venue_kind == "dex" for l in only_dex.legs if l.found),
+          str([l.venue for l in only_dex.legs]))
+    check("и маршрут всё равно нашёлся",
+          only_dex.routed == ["AAVE → DAI через BNB"], str(only_dex.routed))
+
+    mixed = dg.diagnose(chain, q7, trade_usd=1_000)
+    check("без фильтра биржа берётся прямым плечом",
+          any(l.venue == "kucoin" for l in mixed.legs),
+          str([l.venue for l in mixed.legs]))
+
     print("\n" + "=" * 70)
     if FAIL:
         print("НЕ ПРОЙДЕНО:", ", ".join(FAIL))
