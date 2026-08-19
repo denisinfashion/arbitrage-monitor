@@ -269,8 +269,9 @@ def explain(cycle, t: Optional[int] = None, amount: Optional[float] = None,
         # получен, иначе разбор будет описывать не то, что посчитано.
         fee_pct = venue_fee_pct(venue, kind)
         fee_mult = 1.0 - fee_pct / 100.0
-        slip_grid = (dex_slippage_factor(base_size, liq) if kind == "dex"
-                     else cex_slippage_factor(base_size, vol))
+        slip_grid = (dex_slippage_factor(base_size, liq, venue=venue,
+                                         base=a, quote=b)
+                     if kind == "dex" else cex_slippage_factor(base_size, vol))
         denom = fee_mult * slip_grid
         spot = exec_rate / denom if denom > 0 else exec_rate
 
@@ -280,8 +281,9 @@ def explain(cycle, t: Optional[int] = None, amount: Optional[float] = None,
             value_usd = cur * mid_rate(grid, t, a, anchor)
             if not math.isfinite(value_usd) or value_usd <= 0:
                 value_usd = amount
-            slip = (dex_slippage_factor(value_usd, liq) if kind == "dex"
-                    else cex_slippage_factor(value_usd, vol))
+            slip = (dex_slippage_factor(value_usd, liq, venue=venue,
+                                        base=a, quote=b)
+                    if kind == "dex" else cex_slippage_factor(value_usd, vol))
             exec_rate = spot * fee_mult * slip
         else:
             slip = slip_grid

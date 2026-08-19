@@ -31,7 +31,8 @@ import numpy as np
 import pandas as pd
 
 from .config import (CEX_TAKER_PCT, DEX_POOL_FEE_PCT, SETTINGS, USD_LIKE,
-                     dex_fee_pct, is_leveraged_token)
+                     dex_fee_pct, is_concentrated, is_leveraged_token,
+                     is_stable)
 
 log = logging.getLogger(__name__)
 
@@ -122,23 +123,57 @@ class RateGrid:
 # --------------------------------------------------------------------------
 
 
-def dex_slippage_factor(trade_usd: float, reserve_usd: Optional[float]) -> float:
-    """Множитель к курсу для пула постоянного произведения.
+def dex_depth_usd(reserve_usd: Optional[float], venue: str = "",
+                  base: str = "", quote: str = "", settings=SETTINGS) -> Optional[float]:
+    """Сколько долларов реально стоит на пути свопа у текущей цены.
 
-    Для пары резервов (R_in, R_out) своп размера S даёт
-        amount_out = R_out * S / (R_in + S)
-    то есть эффективный курс хуже спота ровно в R_in / (R_in + S) раз.
-    Резерв пула в долларах делится пополам между сторонами, поэтому
-    R_in ≈ reserve_usd / 2.
+    Раньше здесь молча стояло `reserve_usd / 2` — половина TVL, как
+    в пуле постоянного произведения. Для V2 это верно. Для V3 — нет,
+    и ошибка выходила не на проценты, а на порядок.
 
-    Для V3 ликвидность сконцентрирована около текущей цены и фактическая
-    глубина выше, чем следует из общего TVL. Оценка получается заниженной —
-    ошибка в безопасную сторону.
+    В V3 поставщик выбирает диапазон цены, и вся его ликвидность стоит
+    внутри него. У текущей цены собирается кратно больше, чем дала бы
+    та же сумма, размазанная по всей кривой от нуля до бесконечности.
+    Насколько больше — зависит от того, какие диапазоны выбрали
+    поставщики, и из TVL это не выводится. Но порядок известен:
+    для обычной пары это единицы, для пары стейблов — десятки, потому
+    что там диапазоны в доли процента.
+
+    Чем это обошлось. Своп на $1000 через пул с TVL $100 000 давал
+    по старой формуле −1.96% на плечо, три плеча — почти −6%. Ни одна
+    настоящая связка на 1–2% не проходила: расчёт съедал её целиком
+    ещё до отбора. При этом потолок правдоподобия стоит на 5%, то есть
+    всё, что могло бы пробиться сквозь такое проскальзывание, мы
+    отбрасывали уже как артефакт. Между двумя порогами не оставалось
+    ничего — и таблица была пустой при живых спредах на рынке.
+
+    Множители намеренно вынесены в настройки: их правильное значение
+    проверяется только реальным свопом. Если расчёт расходится с тем,
+    что получилось на самом деле, крутить надо здесь.
     """
     if not reserve_usd or reserve_usd <= 0:
+        return None
+    depth = float(reserve_usd) / 2.0
+    if is_concentrated(venue):
+        depth *= max(1.0, float(getattr(settings, "dex_v3_depth_multiple", 10.0)))
+    if base and quote and is_stable(base) and is_stable(quote):
+        depth *= max(1.0, float(getattr(settings, "dex_stable_depth_multiple", 5.0)))
+    return depth
+
+
+def dex_slippage_factor(trade_usd: float, reserve_usd: Optional[float],
+                        venue: str = "", base: str = "", quote: str = "",
+                        settings=SETTINGS) -> float:
+    """Множитель к курсу: во сколько раз исполнение хуже спота.
+
+    Для глубины D своп размера S даёт amount_out = R_out·S/(D+S),
+    то есть курс хуже ровно в D/(D+S) раз. Вся содержательная часть —
+    в оценке D, она в dex_depth_usd выше.
+    """
+    depth = dex_depth_usd(reserve_usd, venue, base, quote, settings)
+    if not depth:
         return 1.0
-    r_in = reserve_usd / 2.0
-    return r_in / (r_in + trade_usd)
+    return depth / (depth + trade_usd)
 
 
 def cex_slippage_factor(trade_usd: float, candle_volume_usd: Optional[float],
@@ -376,8 +411,13 @@ def build_grid(
     if apply_slippage:
         slip = np.ones(len(df), dtype=np.float64)
         is_dex = kinds == "dex"
+        venues = df["venue"].to_numpy()
+        bases, quotes = df["base"].to_numpy(), df["quote"].to_numpy()
         for idx in np.flatnonzero(is_dex):
-            slip[idx] = dex_slippage_factor(trade, liq[idx] if liq[idx] == liq[idx] else None)
+            slip[idx] = dex_slippage_factor(
+                trade, liq[idx] if liq[idx] == liq[idx] else None,
+                venue=str(venues[idx]), base=str(bases[idx]),
+                quote=str(quotes[idx]), settings=settings)
         for idx in np.flatnonzero(~is_dex):
             v_usd = vol[idx] * price[idx] if vol[idx] == vol[idx] else None
             slip[idx] = cex_slippage_factor(trade, v_usd)

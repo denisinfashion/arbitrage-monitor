@@ -29,7 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from history import store
+from history import live, store
 from history.config import (CODE_VERSION, DATA_DIR, SETTINGS,
                             ensure_data_dir)
 from history.snapshot import export_snapshot, import_snapshot
@@ -51,6 +51,29 @@ def setup_logging(verbose: bool = False) -> None:
         stream=sys.stdout,
     )
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+
+
+def publish_live(source) -> None:
+    """Выкладывает свежие цены сразу после среза, не дожидаясь снимка.
+
+    Снимок весит десятки мегабайт и уезжает раз в прогон — цены на
+    странице старели в среднем на восемь минут, при том что спред живёт
+    пять. Здесь уходит двадцать килобайт после каждого среза, то есть
+    раз в три минуты. Ошибка публикации прогон не ломает: снимок всё
+    равно уйдёт в конце, просто позже.
+    """
+    candles = list(getattr(source, "last_candles", []) or [])
+    if not candles:
+        return
+    rows = live.rows_from_candles(candles)
+    path = live.write_live(rows, chain=SETTINGS.chain)
+    if path is None:
+        return
+    if live.publish_live(path):
+        log.info("свежие цены опубликованы: %d котировок", len(rows))
+    else:
+        log.info("свежие цены записаны локально: %d котировок", len(rows))
 
 
 def run_bounded(label: str, fn, seconds: float, default=0):
@@ -208,6 +231,7 @@ def main(argv=None) -> int:
         else:
             log.info("справочник пулов свежий — полный поиск пропущен")
             run_bounded("DEX срез", c.dex.pulse, min(90.0, left()))
+        publish_live(c.dex)
 
     # Биржи: discover каждой ограничен, чтобы недоступная площадка
     # не съела прогон целиком.
@@ -291,6 +315,7 @@ def main(argv=None) -> int:
             # Срез, а не поиск: цены уже известных пулов обходятся
             # четырьмя запросами вместо тридцати.
             run_bounded("DEX срез", c.dex.pulse, min(90.0, deadline - now))
+            publish_live(c.dex)
             pulses += 1
             next_pulse = time.time() + pulse
             continue

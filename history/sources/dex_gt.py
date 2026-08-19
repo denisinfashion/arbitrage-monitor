@@ -106,6 +106,13 @@ class GeckoTerminalSource:
         self.name = f"gt:{settings.chain}"
         self.chain = settings.chain
         self._pools: List[dict] = []
+        self.last_candles: List[Candle] = []
+        """Свечи последнего среза — для быстрой публикации свежих цен.
+
+        Держим их отдельно от базы намеренно. Записанное в базу уедет
+        к странице только внутри снимка, то есть в конце прогона, а смысл
+        быстрого канала в том, чтобы отдать цены сразу после среза.
+        """
         self.last_backfill_complete = False
         """Очередь пулов дошла до конца и лимит не мешал."""
         self.api, self.headers = endpoint(settings)
@@ -289,7 +296,9 @@ class GeckoTerminalSource:
         keep = {p["pool"] for p in pools}
 
         write_pools(pools)
-        written = write_candles([c for c in candles if c.pool in keep])
+        kept_candles = [c for c in candles if c.pool in keep]
+        self.last_candles = kept_candles
+        written = write_candles(kept_candles)
         self._pools = pools
 
         set_state(self.name, "discover", ok=bool(pools),
@@ -531,6 +540,7 @@ class GeckoTerminalSource:
             known.update({p["pool"]: p for p in fresh})
             self._pools = list(known.values())
 
+        self.last_candles = candles
         written = write_candles(candles)
         set_state(self.name, "pulse", ok=bool(written), rows=written,
                   error="" if written else "срез пуст")

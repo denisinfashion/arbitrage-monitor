@@ -36,3 +36,5 @@ jobs:
         run: python -m history.tests.test_inventory
       - name: Охват — активы и площадки
         run: python -m history.tests.test_scale
+      - name: Свежие цены и глубина пулов
+        run: python -m history.tests.test_live
