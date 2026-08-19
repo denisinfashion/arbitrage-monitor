@@ -77,7 +77,11 @@ auto = c2.toggle("Автообновление", value=False, help="перечи
 # --------------------------------------------------------------------------
 
 stats = snapshot.stats()
-st.caption(f"Источник: {snapshot.source_label()}")
+try:
+    from history.config import CODE_VERSION
+except ImportError:
+    CODE_VERSION = "неизвестна"
+st.caption(f"Источник: {snapshot.source_label()} · версия кода {CODE_VERSION}")
 
 if stats["rows"] == 0:
     if CLOUD:

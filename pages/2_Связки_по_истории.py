@@ -21,13 +21,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from history import snapshot, store
 from history.config import SETTINGS
 from history.ui import FULL
-from history.breakdown import explain
 from history.paths import find_cycles
 from history.rates import build_grid
 
+try:
+    from history.breakdown import explain
+except ImportError:          # модуль из более нового обновления ещё не разложен
+    explain = None
+
 st.set_page_config(page_title="Связки по истории", layout="wide")
 st.title("Арбитражные связки по истории")
-st.caption(f"Источник данных: {snapshot.source_label()}")
+try:
+    from history.config import CODE_VERSION
+except ImportError:
+    CODE_VERSION = "неизвестна"
+st.caption(f"Источник данных: {snapshot.source_label()} · версия {CODE_VERSION}")
 
 if not snapshot.data_available():
     st.warning("Нет данных. Как их получить — на странице «Сбор данных».")
@@ -156,6 +164,56 @@ with st.sidebar:
 # --------------------------------------------------------------------------
 
 
+STALE: list = []
+"""Возможности, которых нет в развёрнутых модулях. Заполняется _supported."""
+
+
+def _supported(fn, **kwargs) -> dict:
+    """Оставляет только те параметры, которые функция действительно знает.
+
+    Защита от неполного обновления. Страница и модули под ней лежат
+    в разных файлах, и при распаковке архива поверх папки часть файлов
+    может остаться прежней — Windows спрашивает про замену по каждой
+    папке отдельно. Тогда новая страница вызывает старую функцию
+    и всё падает с невнятным TypeError в облаке.
+
+    Правильное поведение здесь — не «тихо продолжить», а «продолжить
+    и сказать, чего не хватает»: расчёт останется верным, просто
+    без новых фильтров, а причина будет названа вслух.
+    """
+    import inspect
+    try:
+        known = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return {}
+    out, missing = {}, []
+    for name, value in kwargs.items():
+        if name in known:
+            out[name] = value
+        else:
+            missing.append(f"{fn.__name__}({name})")
+    for m in missing:
+        if m not in STALE:
+            STALE.append(m)
+    return out
+
+
+# Проверяем сразу, не дожидаясь расчёта: compute кэшируется, и при попадании
+# в кэш проверка внутри неё просто не выполнилась бы.
+_supported(build_grid, drop_suspicious=True)
+_supported(find_cycles, max_margin_pct=1.0)
+if STALE:
+    st.warning(
+        "Обновление применено не полностью: модули под страницей старее "
+        "самой страницы, часть возможностей отключена — "
+        + ", ".join(STALE)
+        + ". Распакуйте архив обновления заново, отвечая «заменить» "
+          "на все вопросы о существующих файлах, и отправьте изменения "
+          "командой `git push`.",
+        icon="⚠️",
+    )
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def compute(window_h: float, anchor: str, max_legs: int, trade_size: float,
             kinds: tuple, apply_slip: bool, staleness: int, gas_leg: float,
@@ -175,12 +233,13 @@ def compute(window_h: float, anchor: str, max_legs: int, trade_size: float,
         grid = build_grid(quotes, settings=s, trade_size_usd=trade_size,
                           venue_kinds=list(kinds), max_assets=max_assets,
                           apply_slippage=apply_slip, spot_only=spot_only,
-                          drop_suspicious=trust)
+                          **_supported(build_grid, drop_suspicious=trust))
         table, cycles = find_cycles(grid, anchor=anchor, max_legs=max_legs,
                                     top=top_n, gas_per_dex_leg_usd=gas_leg,
                                     min_margin_pct=min_margin,
-                                    max_margin_pct=max_margin,
-                                    sort_by=sort_by, settings=s)
+                                    sort_by=sort_by, settings=s,
+                                    **_supported(find_cycles,
+                                                 max_margin_pct=max_margin))
         if one_chain and cycles:
             keep = [i for i, c in enumerate(cycles) if not c.needs_transfer()]
             if keep:
@@ -263,8 +322,19 @@ if notes:
 if table is None or table.empty:
     st.info(
         "Прибыльных связок выше порога не найдено. Это нормальный результат: "
-        "на ликвидных парах спред обычно меньше суммарных комиссий. "
-        "Попробуйте снизить порог маржи, расширить окно или добавить площадки."
+        "на ликвидных парах спред обычно меньше суммарных комиссий."
+    )
+    st.markdown(
+        "**Что попробовать по порядку.**\n\n"
+        "1. Опустить **порог маржи** до −1%: станет видно, насколько близко "
+        "связки подходят к нулю. Если лучшая около −0.1%, дело в издержках "
+        "и достаточно дождаться движения цены; если около −3%, дело не в них.\n"
+        "2. Снять галочку **«Только без переводов»** — появятся связки через "
+        "биржи, они обычно шире по марже, но требуют перевода между площадками.\n"
+        "3. Расширить **окно анализа**: за сутки окон больше, чем за шесть часов.\n"
+        "4. Проверить на странице **«Токены под наблюдением»**, собираются ли "
+        "вообще интересующие вас токены. Отсутствие связки и отсутствие данных "
+        "выглядят одинаково, но означают разное."
     )
     st.stop()
 
@@ -472,9 +542,11 @@ with b2:
                       help="«Сейчас» — последняя точка истории. "
                            "«Лучший» — момент максимальной маржи за окно.")
 
-br = explain(cyc, amount=amount, prefer=moment)
+br = explain(cyc, amount=amount, prefer=moment) if explain else None
 
-if br is None:
+if explain is None:
+    st.info("Модуль разбора не найден — обновление применено не полностью.")
+elif br is None:
     st.info("В выбранный момент нет полного набора курсов для этой связки.")
 else:
     with b3:

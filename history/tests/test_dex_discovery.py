@@ -165,8 +165,15 @@ def main() -> int:
     syms = {p["base"] for p in pools} | {p["quote"] for p in pools}
     check("AAVE добран принудительно", "AAVE" in syms)
     check("DAI добран принудительно", "DAI" in syms)
-    check("поиск вызывался по каждому тикеру",
-          sum(1 for u in calls if u.endswith("/search/pools")) == 2)
+    # Список наблюдения складывается из трёх источников: файла
+    # watchlist.txt, переменной окружения и настроек. Проверяем, что
+    # запрос ушёл по каждому тикеру итогового списка, а не только
+    # по тем, что заданы здесь.
+    from history.config import load_watchlist
+    expected = load_watchlist(s)
+    check("поиск вызывался по каждому тикеру списка",
+          sum(1 for u in calls if u.endswith("/search/pools")) == len(expected),
+          f"{len(expected)} тикеров: {', '.join(expected)}")
 
     print("\n4. Живые цены записаны")
     st = store.stats()

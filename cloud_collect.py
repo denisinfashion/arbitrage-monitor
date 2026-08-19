@@ -30,12 +30,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from history import store
-from history.config import DATA_DIR, SETTINGS, ensure_data_dir
+from history.config import (CODE_VERSION, DATA_DIR, SETTINGS,
+                            ensure_data_dir)
 from history.snapshot import export_snapshot, import_snapshot
 
 log = logging.getLogger("cloud")
 
-CODE_VERSION = "2026-08-18.1"
+# Версия берётся из history/config.py — она же выводится на страницах.
 # Отметка версии в логе. Нужна из-за реального случая: прогон в CI дважды
 # шёл на старом коде — сперва потому, что коммит не был отправлен на сервер,
 # затем потому, что вместо нового запуска был повтор прежнего (повтор берёт

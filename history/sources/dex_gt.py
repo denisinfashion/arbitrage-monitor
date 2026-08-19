@@ -27,7 +27,8 @@ import logging
 import time
 from typing import Dict, List, Optional, Tuple
 
-from ..config import DEX_POOL_FEE_PCT, SETTINGS, norm_asset
+from ..config import (DEX_POOL_FEE_PCT, SETTINGS, load_watchlist,
+                      norm_asset)
 from ..http import HttpError, get_json
 from ..store import Candle, get_last_ts, set_state, write_candles, write_pools
 
@@ -197,7 +198,7 @@ class GeckoTerminalSource:
                 log.debug("%s: +%d пулов площадки %s", self.name, got, dex)
 
         # --- 3. Список наблюдения ------------------------------------------
-        for token in self.s.watch_tokens or []:
+        for token in load_watchlist(self.s):
             try:
                 payload = get_json(
                     f"{self.api}/search/pools",
