@@ -299,6 +299,17 @@ def _maxplus(a: np.ndarray, b: np.ndarray, chunk: Optional[int] = None
     return out, arg
 
 
+DENSE_LIMIT = 60
+"""До скольких активов имеет смысл полный перебор всех пар.
+
+Полная схема считает лучший переход между *всеми* парами активов —
+это T·n³ операций. При шестидесяти активах это десятки миллионов
+и доли секунды, при двухстах — миллиарды и минуты ожидания. Выше
+порога работает поиск от якоря: он дешевле на порядки и находит
+ровно то, что нужно, — циклы, начинающиеся и кончающиеся на USDT.
+"""
+
+
 def _candidate_paths(
     grid: RateGrid,
     anchor_idx: int,
@@ -306,7 +317,105 @@ def _candidate_paths(
     subsample: int,
     per_step: int,
 ) -> List[Tuple[int, ...]]:
-    """Собирает набор перспективных маршрутов на прореженной выборке."""
+    """Собирает набор перспективных маршрутов на прореженной выборке.
+
+    Две схемы, и они дополняют друг друга.
+
+    **От якоря** (всегда). Маржа цикла — сумма логарифмов курсов, а
+    max-plus — полукольцо, поэтому лучший путь из USDT в каждый актив
+    за k шагов считается обычной релаксацией: вектор длины n умножается
+    на матрицу, T·n² операций на шаг. Ни разу не требуется знать лучший
+    путь между произвольной парой активов — цикл всё равно начинается
+    и кончается на якоре.
+
+    **Все пары** (пока активов немного). Даёт больше разнообразия:
+    берётся не единственный лучший предшественник, а верхушка по всем
+    парам сразу. При n ≤ DENSE_LIMIT это дёшево, и результаты
+    объединяются с первой схемой.
+    """
+    found = _candidate_paths_anchored(grid, anchor_idx, max_legs,
+                                      subsample, per_step)
+    if grid.n_assets <= DENSE_LIMIT:
+        found |= set(_candidate_paths_dense(grid, anchor_idx, max_legs,
+                                            subsample, per_step))
+    return sorted(found)
+
+
+def _candidate_paths_anchored(
+    grid: RateGrid,
+    anchor_idx: int,
+    max_legs: int,
+    subsample: int,
+    per_step: int,
+) -> set:
+    """Поиск циклов релаксацией от якоря: T·n² на шаг вместо T·n³.
+
+    dist[t, j] — лучшая сумма логарифмов пути «якорь → … → j» ровно за
+    k ног в момент t; par[t, j] — предпоследний узел этого пути.
+    Замыкание цикла — прибавить курс j → якорь.
+    """
+    W = grid.log_rate
+    sel = np.arange(0, grid.n_times, max(1, subsample))
+    Ws = np.ascontiguousarray(W[sel])
+    T, n, _ = Ws.shape
+
+    found: set = set()
+    back = Ws[:, :, anchor_idx]              # (T, n) курс j -> якорь
+    dist = Ws[:, anchor_idx, :].copy()       # (T, n) один шаг из якоря
+    parents: List[np.ndarray] = []
+
+    for legs in range(2, max_legs + 1):
+        # Замыкаем цикл длиной legs: путь за legs-1 шаг плюс шаг назад.
+        closing = dist + back
+        _harvest_1d(
+            closing, per_step,
+            lambda j, t, _p=list(parents): _walk_back(anchor_idx, j, _p, t),
+            found,
+        )
+        if legs == max_legs:
+            break
+
+        # Наращиваем путь ещё на шаг. Пачками по времени: промежуточный
+        # тензор — chunk·n², и при большом n он один способен съесть
+        # всю память бесплатного тарифа.
+        chunk = max(1, min(T, int(64e6 / max(1, n * n * 4))))
+        nxt = np.full((T, n), NEG_INF, dtype=np.float32)
+        par = np.full((T, n), -1, dtype=np.int16)
+        for s in range(0, T, chunk):
+            e = min(s + chunk, T)
+            cand = dist[s:e, :, None] + Ws[s:e]      # (t, j_prev, j_next)
+            np.nan_to_num(cand, copy=False, nan=NEG_INF, neginf=NEG_INF)
+            nxt[s:e] = cand.max(axis=1)
+            par[s:e] = cand.argmax(axis=1).astype(np.int16)
+            del cand
+        parents.append(par)
+        dist = nxt
+
+    return found
+
+
+def _walk_back(anchor: int, last: int, parents: Sequence[np.ndarray],
+               t: int) -> Tuple[int, ...]:
+    """Разворачивает путь по таблицам предшественников от конца к началу."""
+    body = [last]
+    node = last
+    for par in reversed(parents):
+        node = int(par[t, node])
+        if node < 0:
+            break
+        body.append(node)
+    body.reverse()
+    return tuple([anchor] + body + [anchor])
+
+
+def _candidate_paths_dense(
+    grid: RateGrid,
+    anchor_idx: int,
+    max_legs: int,
+    subsample: int,
+    per_step: int,
+) -> List[Tuple[int, ...]]:
+    """Полный перебор пар через max-plus. Дорог по времени: T·n³."""
     W = grid.log_rate
     T = grid.n_times
     sel = np.arange(0, T, max(1, subsample))

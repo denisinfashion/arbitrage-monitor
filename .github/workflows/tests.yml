@@ -34,3 +34,5 @@ jobs:
         run: python -m history.tests.test_breakdown
       - name: Инвентарь токенов
         run: python -m history.tests.test_inventory
+      - name: Охват — активы и площадки
+        run: python -m history.tests.test_scale

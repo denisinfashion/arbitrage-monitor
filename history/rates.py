@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -170,6 +171,47 @@ def venue_fee_pct(venue: str, venue_kind: str, pool_fee: Optional[float] = None)
 
 
 # --------------------------------------------------------------------------
+# Сколько активов помещается
+# --------------------------------------------------------------------------
+
+BYTES_PER_CELL = 6
+"""float32 на курс плюс int16 на индекс площадки."""
+
+
+def budget_bytes() -> int:
+    """Сколько памяти отводится под сетку курсов.
+
+    Раньше потолок задавался числом ячеек и был один на все случаи.
+    Это неудобно: при часовом шаге точек мало и активов помещается
+    в разы больше, чем при минутном, а пользователь видел один и тот же
+    жёсткий предел в сорок штук и справедливо спрашивал, почему нельзя
+    взять все. Теперь ограничение считается от памяти и раскрывается
+    в число активов под конкретное окно.
+
+    Переопределяется переменной `ARB_GRID_BUDGET_MB`.
+    """
+    default = 250 if os.environ.get("ARB_SNAPSHOT_URL") else 1200
+    try:
+        mb = float(os.environ.get("ARB_GRID_BUDGET_MB", default))
+    except (TypeError, ValueError):
+        mb = default
+    return int(max(16.0, mb) * 1e6)
+
+
+def grid_bytes(n_times: int, n_assets: int) -> int:
+    return int(n_times) * int(n_assets) ** 2 * BYTES_PER_CELL
+
+
+def max_assets_for(n_times: int, budget: Optional[int] = None) -> int:
+    """Сколько активов помещается в бюджет при данном числе точек."""
+    budget = budget or budget_bytes()
+    if n_times <= 0:
+        return 1000
+    n = int((budget / (BYTES_PER_CELL * n_times)) ** 0.5)
+    return max(10, min(1000, n))
+
+
+# --------------------------------------------------------------------------
 # Сборка сетки
 # --------------------------------------------------------------------------
 
@@ -277,16 +319,12 @@ def build_grid(
     v_pos = {v: i for i, v in enumerate(venue_list)}
 
     log.info("сетка: %d точек x %d активов x %d площадок", T, n, len(venue_list))
-    # Потолок по памяти. Сетка занимает T*n*n ячеек float32 плюс столько же
-    # int16 под индексы площадок — примерно 6 байт на ячейку. В облаке
-    # с гигабайтом памяти позволить себе можно заметно меньше.
-    import os
-    cap = 60_000_000 if os.environ.get("ARB_SNAPSHOT_URL") else 400_000_000
-    cells = T * n * n
-    if cells > cap:
+    limit = max_assets_for(T)
+    if n > limit:
         raise MemoryError(
-            f"Сетка {T}x{n}x{n} — это {cells * 6 / 1e6:.0f} МБ, "
-            f"больше допустимых {cap * 6 / 1e6:.0f} МБ."
+            f"Сетка {T}×{n}×{n} заняла бы {grid_bytes(T, n) / 1e6:.0f} МБ "
+            f"при бюджете {budget_bytes() / 1e6:.0f} МБ. "
+            f"При шаге сетки в {T} точек помещается до {limit} активов."
         )
 
     # --- 3. Свежесть ------------------------------------------------------

@@ -116,7 +116,10 @@ def _run_alerts() -> None:
     s.analysis_timeframe = os.environ.get("ALERT_TIMEFRAME", "5m")
     s.staleness_sec = int(os.environ.get("ALERT_STALENESS", "900"))
 
-    grid = build_grid(quotes, settings=s, venue_kinds=["dex"], max_assets=40)
+    # Активов берём с запасом: поиск от якоря стоит T·n², и полторы
+    # сотни токенов считаются за секунды. Прежние сорок были
+    # ограничением полного перебора, которого здесь больше нет.
+    grid = build_grid(quotes, settings=s, venue_kinds=["dex"], max_assets=150)
     _, cycles = find_cycles(grid, anchor=s.quote_asset, max_legs=s.max_legs,
                             top=40, min_margin_pct=-100, settings=s)
     n = alerts.notify(cycles)

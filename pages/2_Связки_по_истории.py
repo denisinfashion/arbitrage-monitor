@@ -22,7 +22,8 @@ from history import snapshot, store
 from history.config import SETTINGS
 from history.ui import FULL
 from history.paths import find_cycles
-from history.rates import build_grid
+from history.rates import (budget_bytes, build_grid, grid_bytes,
+                           max_assets_for)
 
 try:
     from history.breakdown import explain
@@ -48,9 +49,9 @@ stats = snapshot.stats()
 # уже 145 МБ только под неё, плюс исходный DataFrame и накладные расходы
 # pandas. Поэтому в облаке потолки ниже, а по умолчанию берётся окно поуже.
 CLOUD = snapshot.cloud_mode()
-LIM_ASSETS = 40 if CLOUD else 120
-DEF_ASSETS = 30 if CLOUD else 60
 DEF_WINDOW = 12.0 if CLOUD else 24.0
+
+TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
 
 # --------------------------------------------------------------------------
 # Параметры
@@ -114,10 +115,23 @@ with st.sidebar:
     gas_leg = st.number_input("Газ за своп на DEX, $", 0.0, 50.0, 0.15, step=0.05)
 
     st.divider()
-    max_assets = st.slider("Активов в анализе", 10, LIM_ASSETS, DEF_ASSETS, step=10,
-                           help="Больше активов — больше связок, но и дольше расчёт. "
-                                + ("Потолок снижен: в облаке около 1 ГБ памяти."
-                                   if CLOUD else ""))
+    # Потолок считается от памяти под конкретное окно, а не задан числом.
+    # При часовом шаге точек в сетке в двенадцать раз меньше, чем при
+    # пятиминутном, и активов помещается в разы больше — фиксированное
+    # «до сорока» было бы неоправданно жёстким.
+    n_points = max(1, int(window_h * 3600 / TF_SECONDS.get(granularity, 300)))
+    lim_assets = max_assets_for(n_points)
+    def_assets = min(lim_assets, 150 if CLOUD else 300)
+    max_assets = st.slider(
+        "Активов в анализе", 10, int(lim_assets), int(def_assets), step=10,
+        help=f"При окне {window_h:.0f} ч с шагом {granularity} в сетке "
+             f"{n_points} точек, и в отведённую память помещается "
+             f"до {lim_assets} активов. Хотите больше — увеличьте шаг "
+             f"или сузьте окно.")
+    st.caption(
+        f"Сетка займёт примерно {grid_bytes(n_points, max_assets) / 1e6:.0f} МБ "
+        f"из {budget_bytes() / 1e6:.0f} МБ бюджета"
+    )
     top_n = st.slider("Строк в таблице", 10, 200, 50, step=10)
     min_margin = st.number_input("Порог маржи, %", -5.0, 10.0, 0.0, step=0.05,
                                  help="Показывать связки, у которых максимум за период выше порога")

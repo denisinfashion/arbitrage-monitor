@@ -74,15 +74,23 @@ class Settings:
     min_pool_reserve_usd: float = 100_000.0
     """Пулы с ликвидностью ниже порога не берём: маржа съедается проскальзыванием."""
 
-    cex_venues: List[str] = field(
-        default_factory=lambda: ["binance", "okx", "bybit", "gate", "kucoin", "mexc"]
-    )
-    """Идентификаторы бирж в терминах ccxt."""
+    cex_venues: List[str] = field(default_factory=lambda: [
+        "binance", "okx", "bybit", "gate", "kucoin", "mexc",
+        "bitget", "htx", "bitmart", "coinex", "kraken", "bitfinex",
+    ])
+    """Идентификаторы бирж в терминах ccxt.
+
+    Список щедрый намеренно: недоступная площадка не ломает прогон —
+    её discover ограничен по времени, и она просто пропускается
+    с записью в лог. В облаке часть из них отвечает 451 (Binance,
+    Bybit блокируют адреса США), поэтому фактический набор задаётся
+    переменной ARB_CEX_VENUES в workflow.
+    """
 
     cex_quote_assets: List[str] = field(default_factory=lambda: ["USDT", "USDC", "BTC", "ETH", "BNB"])
     """Котируемые валюты, по которым тянем пары с CEX."""
 
-    cex_symbol_limit: int = 200
+    cex_symbol_limit: int = 250
     """Максимум пар на биржу (отбор по объёму за 24 ч)."""
 
     spot_only: bool = True
@@ -213,7 +221,7 @@ def load_watchlist(settings=None) -> List[str]:
     return out
 
 
-CODE_VERSION = "2026-08-19.2"
+CODE_VERSION = "2026-08-19.3"
 """Отметка версии модулей.
 
 Нужна из-за реального случая: при распаковке обновления поверх папки
