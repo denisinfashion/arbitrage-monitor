@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -94,6 +95,45 @@ def _parse_pool_name(name: str) -> Tuple[str, str]:
         return "", ""
     left, _, right = name.partition("/")
     return left.strip().upper(), right.strip().split()[0].upper() if right.strip() else ""
+
+
+# Уровень комиссии пула. Ищется в трёх местах по убыванию надёжности,
+# и это не педантизм: у V3 уровни 0.01 / 0.05 / 0.25 / 1 процента, то есть
+# разница между крайними в сто раз. Пара стейблов почти всегда стоит
+# на 0.01, а мы брали ей общие для площадки 0.25 — на трёхногой связке
+# это выдуманные три четверти процента, больше самой маржи.
+_FEE_IN_NAME = re.compile(r"(\d+(?:[.,]\d+)?)\s*%")
+
+
+def _pool_fee_pct(attrs: dict, dex_id: str) -> float:
+    """Комиссия конкретного пула в процентах, а не средняя по площадке."""
+    # Поля, где значение заведомо в процентах.
+    for key in ("pool_fee_percentage", "fee_percentage"):
+        val = _f(attrs.get(key))
+        if val and 0 < val <= 100:
+            return val
+
+    # Uniswap-подобный уровень: сотые доли базисного пункта.
+    # 500 -> 0.05%, 3000 -> 0.3%, 10000 -> 1%.
+    for key in ("fee_tier", "pool_fee", "fee"):
+        val = _f(attrs.get(key))
+        if not val or val <= 0:
+            continue
+        return val / 10_000.0 if val > 100 else val
+
+    # GeckoTerminal нередко пишет уровень прямо в имени пула:
+    # «WBNB / USDT 0.05%». На бесплатном тарифе это единственный
+    # источник, и он лучше, чем среднее по площадке.
+    match = _FEE_IN_NAME.search(attrs.get("name") or "")
+    if match:
+        try:
+            val = float(match.group(1).replace(",", "."))
+        except ValueError:
+            val = 0.0
+        if 0 < val <= 100:
+            return val
+
+    return dex_fee_pct(dex_id)
 
 
 class GeckoTerminalSource:
@@ -427,7 +467,7 @@ class GeckoTerminalSource:
             "quote_name": quote_name,
             "reserve_usd": _f(attrs.get("reserve_in_usd")),
             "volume_24h": _f((attrs.get("volume_usd") or {}).get("h24")),
-            "fee_pct": dex_fee_pct(dex_id),
+            "fee_pct": _pool_fee_pct(attrs, dex_id),
             # не пишется в таблицу pools, используется ниже
             "_base_usd": _f(attrs.get("base_token_price_usd")),
             "_quote_usd": _f(attrs.get("quote_token_price_usd")),

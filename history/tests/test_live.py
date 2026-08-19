@@ -300,6 +300,92 @@ def main() -> int:
           any(l.venue == "kucoin" for l in mixed.legs),
           str([l.venue for l in mixed.legs]))
 
+    print("\n9. Комиссия берётся у пула, а не средняя по площадке")
+
+    from history.sources.dex_gt import _pool_fee_pct
+
+    check("уровень из имени пула",
+          _pool_fee_pct({"name": "WBNB / USDT 0.05%"}, "pancakeswap-v3-bsc") == 0.05)
+    check("явное поле в процентах",
+          _pool_fee_pct({"pool_fee_percentage": "0.01"}, "x") == 0.01)
+    check("уровень Uniswap в сотых базисного пункта",
+          _pool_fee_pct({"fee_tier": 3000}, "x") == 0.3)
+    check("без подсказок — средняя по площадке",
+          _pool_fee_pct({"name": "AAVE / DAI"}, "uniswap-bsc") == 0.3)
+
+    from history.rates import pool_fee_map
+    pools = pd.DataFrame([{"pool": "0x1", "fee_pct": 0.01},
+                          {"pool": "0x2", "fee_pct": None},
+                          {"pool": "0x3", "fee_pct": 250.0}])
+    fees = pool_fee_map(pools)
+    check("справочник комиссий собран", fees == {"0x1": 0.01}, str(fees))
+    check("пустой справочник не роняет", pool_fee_map(None) == {})
+
+    q8 = q.copy()
+    q8["pool"] = ["0x1", "0x2", "0x3"]
+    rep8 = dg.diagnose(chain, q8, trade_usd=1_000, fees={"0x1": 0.01})
+    check("своя комиссия пула применена",
+          abs(rep8.legs[0].fee_pct - 0.01) < 1e-9, f"{rep8.legs[0].fee_pct}%")
+    check("остальные плечи по площадке",
+          abs(rep8.legs[1].fee_pct - 0.3) < 1e-9, f"{rep8.legs[1].fee_pct}%")
+    check("итог вырос на сэкономленной комиссии",
+          rep8.net_pct > rep.net_pct,
+          f"{rep8.net_pct:+.3f}% против {rep.net_pct:+.3f}%")
+
+    print("\n10. Протухшая цена помечается, а не выдаётся за свежую")
+
+    q9 = q.copy()
+    q9.loc[0, "ts"] = now - 3 * 3600
+    q9.loc[1, "ts"] = now - 3 * 3600
+    q9.loc[2, "ts"] = now - 3 * 3600
+    rep9 = dg.diagnose(chain, q9, trade_usd=1_000, max_age_sec=900)
+    check("все плечи отмечены как устаревшие",
+          all("устарел" in l.note for l in rep9.legs), str([l.note for l in rep9.legs]))
+    check("свежие данные пометки не получают",
+          not any("устарел" in l.note for l in rep.legs))
+
+    print("\n11. Оповещение не уходит по токенам без листинга")
+
+    import numpy as np
+    from history.alerts import AlertConfig, pick
+    from history.quality import credible_assets, exotic_in
+    from history.rates import RateGrid
+
+    def make_cycle(assets, venue, kind, liq):
+        grid = RateGrid(
+            times=np.array([now]), assets=list(dict.fromkeys(assets)),
+            venues=[venue], log_rate=np.zeros((1, 1, 1), dtype=np.float32),
+            venue_idx=np.zeros((1, 1, 1), dtype=np.int16), trade_size_usd=1000.0,
+            venue_kind={venue: kind},
+            venue_chain={venue: "bsc" if kind == "dex" else ""},
+        )
+        for x, y in zip(assets, assets[1:]):
+            grid.pair_liquidity[(venue, x, y)] = liq
+            grid.pair_liquidity[(venue, y, x)] = liq
+        from history.paths import Cycle
+        return Cycle(assets=tuple(assets),
+                     log_margin=np.array([np.log(1.006)]),
+                     venues=[np.array([0])] * (len(assets) - 1), grid=grid)
+
+    meme = make_cycle(["USDT", "SPCXB", "MARSCOIN", "USDT"],
+                      "pancakeswap-v3-bsc", "dex", 287_402.0)
+    known = credible_assets(meme.grid)
+    check("монеты без листинга опознаны",
+          exotic_in(meme, known) == ["SPCXB", "MARSCOIN"],
+          str(exotic_in(meme, known)))
+
+    cfg = AlertConfig(min_margin_pct=0.3, min_liquidity_usd=30_000)
+    check("такая связка в чат не уходит", pick([meme], cfg, {}) == [])
+
+    listed = make_cycle(["USDT", "BNB", "CAKE", "USDT"],
+                        "pancakeswap-v3-bsc", "dex", 287_402.0)
+    check("связка из известных токенов уходит",
+          len(pick([listed], cfg, {})) == 1)
+
+    off = AlertConfig(min_margin_pct=0.3, min_liquidity_usd=30_000,
+                      require_known_tokens=False)
+    check("проверку можно выключить", len(pick([meme], off, {})) == 1)
+
     print("\n" + "=" * 70)
     if FAIL:
         print("НЕ ПРОЙДЕНО:", ", ".join(FAIL))

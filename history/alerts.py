@@ -72,6 +72,17 @@ class AlertConfig:
     mute_minutes: int = 90
     """Сколько молчать про уже отправленную связку."""
 
+    require_known_tokens: bool = True
+    """Слать только связки из токенов, прошедших листинг хотя бы где-то.
+
+    Не про ликвидность, а про налог на перевод. У монет вроде SPCXB или
+    MARSCOIN контракт удерживает несколько процентов при покупке или
+    продаже; в цене пула этого не видно, расчёт выходит прибыльным,
+    а сделка — убыточной. Прочитать контракт мы не можем, но токен,
+    торгующийся на бирже, контракт уже проходил: с налогом на перевод
+    туда не берут, он ломает биржевые кошельки.
+    """
+
     @classmethod
     def from_env(cls) -> "AlertConfig":
         def num(name, default):
@@ -86,6 +97,7 @@ class AlertConfig:
             require_single_chain=os.environ.get("ALERT_SINGLE_CHAIN", "1") != "0",
             max_per_run=num("ALERT_MAX_PER_RUN", 5),
             mute_minutes=num("ALERT_MUTE_MINUTES", 90),
+            require_known_tokens=os.environ.get("ALERT_KNOWN_TOKENS", "1") != "0",
         )
 
 
@@ -146,6 +158,8 @@ def pick(cycles: Sequence, cfg: AlertConfig, sent: dict) -> List:
 
     out = []
     wild = []
+    exotic_seen = []
+    known = None
     seen_keys = set()
     for c in cycles:
         m = c.margin_pct()
@@ -166,12 +180,27 @@ def pick(cycles: Sequence, cfg: AlertConfig, sent: dict) -> List:
         if cfg.require_single_chain and c.needs_transfer():
             continue
 
+        if cfg.require_known_tokens:
+            from .quality import credible_assets, exotic_in
+            if known is None:
+                known = credible_assets(c.grid)
+            unknown = exotic_in(c, known)
+            if unknown:
+                exotic_seen.append((c.label, unknown))
+                continue
+
         key = mute_key(c)
         if key in sent or key in seen_keys:
             continue
         seen_keys.add(key)
 
         out.append((now_margin, c))
+
+    if exotic_seen:
+        log.warning(
+            "не отправлено: токены не торгуются ни на одной бирже, возможен "
+            "налог на перевод — %s",
+            "; ".join(f"{lbl} ({', '.join(u)})" for lbl, u in exotic_seen[:5]))
 
     if wild:
         log.warning("не отправлено как недостоверное (маржа выше %.1f%%): %s",

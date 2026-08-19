@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set
 
 import pandas as pd
 
@@ -322,3 +322,67 @@ def implausible(margin_pct: float,
         return float(margin_pct) > float(ceiling)
     except (TypeError, ValueError):
         return False
+
+
+# --------------------------------------------------------------------------
+# Доверие к токену
+# --------------------------------------------------------------------------
+
+
+def credible_assets(grid) -> Set[str]:
+    """Тикеры, которым можно верить настолько, чтобы будить человека ночью.
+
+    Повод: в чат ушло оповещение о связке USDT → SPCXB → MARSCOIN → USDT
+    с маржой +0.363%, а на деле она отрицательная. Ни один из наших
+    фильтров тут не помог, и не мог: пулы крупные, оборот есть, маржа
+    скромная и правдоподобная, цепочка в одной сети. Всё сходится.
+
+    Не сходится другое — сами токены. У монет такого рода почти всегда
+    есть налог на перевод: контракт удерживает три-десять процентов при
+    покупке или продаже. В цене пула этого не видно вовсе, и никакой
+    источник котировок про это не расскажет. Расчёт по ценам получается
+    честным, а сделка — убыточной.
+
+    Проверить наличие налога, не читая контракт, нельзя. Зато есть
+    хороший косвенный признак: токен, прошедший листинг на бирже.
+    Биржа проверяет контракт до листинга, и токен с налогом на перевод
+    туда не попадает — он ломает биржевые кошельки. Поэтому «торгуется
+    хотя бы на одной бирже» здесь означает не ликвидность, а то, что
+    контракт кто-то читал.
+
+    Список наблюдения тоже считается достаточным основанием: раз токен
+    вписали руками, человек берёт риск на себя сознательно.
+    """
+    known: Set[str] = set(NEVER_DROP)
+    for table in CANONICAL.values():
+        known.update(table.keys())
+
+    for (venue, a, b) in getattr(grid, "pair_liquidity", {}):
+        if grid.venue_kind.get(venue) == "cex":
+            known.add(a)
+            known.add(b)
+    for (venue, a, b) in getattr(grid, "pair_volume_usd", {}):
+        if grid.venue_kind.get(venue) == "cex":
+            known.add(a)
+            known.add(b)
+
+    try:
+        from .config import SETTINGS, load_watchlist
+        known.update(w.upper() for w in load_watchlist(SETTINGS))
+    except Exception:  # noqa: BLE001 — список наблюдения необязателен
+        pass
+    return known
+
+
+def exotic_in(cycle, known: Optional[Set[str]] = None) -> List[str]:
+    """Активы связки, которых нет ни на одной бирже и ни в одном списке."""
+    if known is None:
+        known = credible_assets(cycle.grid)
+    seen, out = set(), []
+    for a in getattr(cycle, "assets", ()):  # noqa: B007
+        a = str(a).upper()
+        if a in known or a in seen:
+            continue
+        seen.add(a)
+        out.append(a)
+    return out

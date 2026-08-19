@@ -267,7 +267,11 @@ def explain(cycle, t: Optional[int] = None, amount: Optional[float] = None,
         # Восстанавливаем спот: сетка хранит уже исполнимый курс, а разложить
         # его на составляющие нужно по тем же формулам, по которым он и
         # получен, иначе разбор будет описывать не то, что посчитано.
-        fee_pct = venue_fee_pct(venue, kind)
+        # Комиссия своя у пула, если источник её сообщил. Берётся через
+        # сетку, чтобы разбор и расчёт не разошлись: сетка считала
+        # исполнимый курс ровно по этому же числу.
+        fee_pct = (grid.fee_for(venue, kind, a, b)
+                   if hasattr(grid, "fee_for") else venue_fee_pct(venue, kind))
         fee_mult = 1.0 - fee_pct / 100.0
         slip_grid = (dex_slippage_factor(base_size, liq, venue=venue,
                                          base=a, quote=b)

@@ -37,7 +37,8 @@ import pandas as pd
 
 from .config import (SETTINGS, dex_fee_pct, is_concentrated, is_stable,
                      norm_asset)
-from .rates import cex_slippage_factor, dex_depth_usd, dex_slippage_factor
+from .rates import (cex_slippage_factor, dex_depth_usd, dex_slippage_factor,
+                    pool_fee_map, venue_fee_pct)
 
 
 @dataclass
@@ -144,14 +145,26 @@ def _rows_for(quotes: pd.DataFrame, a: str, b: str) -> pd.DataFrame:
     return out[out["_rate"].notna() & (out["_rate"] > 0)]
 
 
-def _leg_cost(row, a: str, b: str, trade_usd: float, settings) -> tuple:
+def pool_fees(settings=SETTINGS) -> dict:
+    """Комиссии пулов из справочника. Пусто, если справочник недоступен."""
+    try:
+        from . import snapshot
+        return pool_fee_map(snapshot.pools(settings.chain))
+    except Exception:  # noqa: BLE001 — справочник необязателен
+        return {}
+
+
+def _leg_cost(row, a: str, b: str, trade_usd: float, settings,
+              fees: Optional[dict] = None) -> tuple:
     """Комиссия и проскальзывание одной котировки. Возвращает (fee_pct, slip)."""
     kind = str(row.get("venue_kind", ""))
     venue = str(row.get("venue", ""))
     if kind == "dex":
         liq = row.get("liquidity_usd")
         liq = float(liq) if liq == liq and liq is not None else None
-        return (dex_fee_pct(venue),
+        pool = row.get("pool")
+        own = (fees or {}).get(str(pool)) if pool else None
+        return (venue_fee_pct(venue, kind, own),
                 dex_slippage_factor(trade_usd, liq, venue=venue, base=a,
                                     quote=b, settings=settings))
     from .config import CEX_TAKER_PCT
@@ -162,7 +175,8 @@ def _leg_cost(row, a: str, b: str, trade_usd: float, settings) -> tuple:
 
 
 def _best_row(quotes: pd.DataFrame, a: str, b: str, trade_usd: float = 1000.0,
-              settings=SETTINGS, max_age: Optional[float] = None):
+              settings=SETTINGS, max_age: Optional[float] = None,
+              fees: Optional[dict] = None):
     """Лучшая исполнимая котировка пары, а не просто самая свежая.
 
     Сперва здесь бралась последняя по времени строка. Это оказалось
@@ -180,25 +194,33 @@ def _best_row(quotes: pd.DataFrame, a: str, b: str, trade_usd: float = 1000.0,
         return None
 
     now = time.time()
+    stale = False
     if max_age:
         fresh = rows[rows["ts"] >= now - max_age]
-        if not fresh.empty:
+        if fresh.empty:
+            # Протухшую цену не прячем, но и молча за свежую не выдаём:
+            # цена трёхчасовой давности в связке — это не связка.
+            stale = True
+        else:
             rows = fresh
 
     best, best_net = None, -1.0
     for _, r in rows.iterrows():
-        fee_pct, slip = _leg_cost(r, a, b, trade_usd, settings)
+        fee_pct, slip = _leg_cost(r, a, b, trade_usd, settings, fees)
         net = float(r["_rate"]) * (1.0 - fee_pct / 100.0) * slip
         if net > best_net:
             best, best_net = r.copy(), net
     if best is None:
         return None
     best["_alternatives"] = len(rows)
+    best["_stale"] = stale
     return best
 
 
 def expand_route(chain: List[str], quotes: pd.DataFrame,
-                 trade_usd: float = 1000.0, settings=SETTINGS) -> tuple:
+                 trade_usd: float = 1000.0, settings=SETTINGS,
+                 max_age: Optional[float] = None,
+                 fees: Optional[dict] = None) -> tuple:
     """Достраивает промежуточные активы там, где прямого рынка нет.
 
     Человек говорит «USDT → AAVE → DAI → USDT», потому что именно так
@@ -217,20 +239,20 @@ def expand_route(chain: List[str], quotes: pd.DataFrame,
         return chain, []
     out, routed = [chain[0]], []
     for a, b in zip(chain, chain[1:]):
-        if _best_row(quotes, a, b, trade_usd, settings) is not None:
+        if _best_row(quotes, a, b, trade_usd, settings, max_age, fees) is not None:
             out.append(b)
             continue
         best_mid, best_net = None, -1.0
         for m in INTERMEDIATES:
             if m in (a, b):
                 continue
-            first = _best_row(quotes, a, m, trade_usd, settings)
-            second = _best_row(quotes, m, b, trade_usd, settings)
+            first = _best_row(quotes, a, m, trade_usd, settings, max_age, fees)
+            second = _best_row(quotes, m, b, trade_usd, settings, max_age, fees)
             if first is None or second is None:
                 continue
             net = 1.0
             for row, x, y in ((first, a, m), (second, m, b)):
-                fee_pct, slip = _leg_cost(row, x, y, trade_usd, settings)
+                fee_pct, slip = _leg_cost(row, x, y, trade_usd, settings, fees)
                 net *= float(row["_rate"]) * (1.0 - fee_pct / 100.0) * slip
             if net > best_net:
                 best_mid, best_net = m, net
@@ -245,7 +267,8 @@ def expand_route(chain: List[str], quotes: pd.DataFrame,
 def diagnose(chain: List[str], quotes: pd.DataFrame, trade_usd: float = 1000.0,
              window_h: float = 6.0, settings=SETTINGS,
              venue_kinds: Optional[List[str]] = None,
-             route: bool = True) -> ChainReport:
+             route: bool = True, max_age_sec: Optional[float] = 900.0,
+             fees: Optional[dict] = None) -> ChainReport:
     """Проходит связку плечо за плечом и объясняет результат.
 
     `venue_kinds` ограничивает площадки. Это не украшение: связка,
@@ -265,15 +288,19 @@ def diagnose(chain: List[str], quotes: pd.DataFrame, trade_usd: float = 1000.0,
         rep.stage, rep.verdict = "input", "Нужно хотя бы два перехода."
         return rep
 
+    if fees is None:
+        fees = pool_fees(settings)
+
     if route and not quotes.empty:
-        chain, rep.routed = expand_route(chain, quotes, trade_usd, settings)
+        chain, rep.routed = expand_route(chain, quotes, trade_usd, settings,
+                                         max_age_sec, fees)
         rep.tickers = list(chain)
 
     product = 1.0
     net_product = 1.0
     for a, b in zip(chain, chain[1:]):
         leg = LegReport(frm=a, to=b)
-        row = (_best_row(quotes, a, b, trade_usd, settings)
+        row = (_best_row(quotes, a, b, trade_usd, settings, max_age_sec, fees)
                if not quotes.empty else None)
         if row is None:
             leg.note = "нет котировок в окне"
@@ -298,8 +325,12 @@ def diagnose(chain: List[str], quotes: pd.DataFrame, trade_usd: float = 1000.0,
         leg.volume_usd = (float(vol) * price
                           if vol == vol and vol is not None else None)
 
+        if bool(row.get("_stale")):
+            leg.note = (leg.note + "; " if leg.note else "") + "цена устарела"
+
         if leg.venue_kind == "dex":
-            leg.fee_pct = dex_fee_pct(leg.venue)
+            own = fees.get(str(leg.pool)) if leg.pool else None
+            leg.fee_pct = venue_fee_pct(leg.venue, "dex", own)
             leg.concentrated = is_concentrated(leg.venue)
             leg.depth_usd = dex_depth_usd(leg.liquidity_usd, leg.venue, a, b,
                                           settings)

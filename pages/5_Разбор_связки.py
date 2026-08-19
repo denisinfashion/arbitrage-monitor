@@ -46,13 +46,18 @@ st.markdown(
     "Замыкание в USDT дописывается само."
 )
 
-col_a, col_b, col_c = st.columns([3, 1, 1])
+col_a, col_b, col_c, col_d = st.columns([3, 1, 1, 1])
 text = col_a.text_input("Цепочка", value="USDT-AAVE-DAI-USDT",
                         label_visibility="collapsed")
 amount = col_b.number_input("Сумма, USDT", min_value=10.0, max_value=1_000_000.0,
                             value=float(SETTINGS.trade_size_usd), step=100.0)
 window_h = col_c.number_input("Окно, ч", min_value=0.25, max_value=48.0,
                               value=6.0, step=0.25)
+max_age_min = col_d.number_input(
+    "Не старше, мин", min_value=1.0, max_value=240.0, value=15.0, step=5.0,
+    help="Цены старше этого возраста в расчёт не идут. Если по плечу "
+         "нет ничего свежее, оно будет показано с пометкой «цена "
+         "устарела» — связка по таким ценам не существует.")
 
 with st.sidebar:
     st.header("Модель глубины")
@@ -134,9 +139,11 @@ def _load(kind: str) -> tuple:
 
 
 if go:
-    st.session_state["diag_last"] = (text, source, amount, window_h, where)
+    st.session_state["diag_last"] = (text, source, amount, window_h, where,
+                                     max_age_min)
 
-text, source, amount, window_h, where = st.session_state["diag_last"]
+(text, source, amount, window_h, where,
+ max_age_min) = st.session_state["diag_last"]
 chain = dg.parse_chain(text)
 if len(chain) < 3:
     st.error("Не разобрал цепочку. Пример: USDT-AAVE-DAI-USDT")
@@ -152,7 +159,17 @@ if quotes.empty:
 
 kinds = ["dex"] if where == "Только на DEX" else ["dex", "cex"]
 rep = dg.diagnose(chain, quotes, trade_usd=amount, window_h=window_h,
-                  venue_kinds=kinds)
+                  venue_kinds=kinds, max_age_sec=max_age_min * 60)
+
+stale = [l for l in rep.legs if "устарел" in (l.note or "")]
+if stale:
+    st.warning(
+        "Свежих цен нет по " + str(len(stale)) + " из " + str(len(rep.legs))
+        + " плеч, взяты последние доступные. Цифры ниже показывают, "
+        "что было, а не что есть: спред живёт минуты. Нажмите "
+        "«Спросить источник сейчас», чтобы посчитать по текущим ценам.",
+        icon="⏳",
+    )
 
 # Раскрытый маршрут показываем до вердикта: иначе непонятно, откуда
 # в таблице взялось плечо, которого человек не вводил.
@@ -226,8 +243,13 @@ with st.expander("Как это считается"):
 
 Издержки на плечо складываются из двух частей.
 
-**Комиссия площадки** — фиксированная для пула, от 0.01% у стабильных
-пар V3 до 0.3% у V2.
+**Комиссия пула** — своя у каждого пула, если источник сообщил уровень:
+GeckoTerminal нередко пишет его прямо в имени, «WBNB / USDT 0.05%».
+У V3 уровни 0.01 / 0.05 / 0.25 / 1 процента, то есть между крайними
+разница в сто раз, и брать среднее по площадке нельзя: паре стейблов
+на 0.01% мы приписывали 0.25%, а на трёх ногах это три четверти
+процента выдуманных издержек. Когда уровень неизвестен, подставляется
+типичный для площадки — это видно по круглому значению 0.25 или 0.3.
 
 **Проскальзывание** — оценка, а не факт. Своп размера S через глубину D
 даёт курс хуже спота в D/(D+S) раз. Весь вопрос в D. Для пула V2

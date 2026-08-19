@@ -72,6 +72,15 @@ class RateGrid:
     pair_pool: Dict[Tuple[str, str, str], str] = field(default_factory=dict)
     """(площадка, актив, актив) -> адрес пула"""
 
+    pool_fee_pct: Dict[str, float] = field(default_factory=dict)
+    """адрес пула -> его собственная комиссия в процентах.
+
+    Не средняя по площадке. У V3 уровни различаются в сто раз: пара
+    стейблов стоит 0.01%, а мы приписывали ей общие для PancakeSwap
+    0.25%. На трёхногой связке это три четверти процента выдуманных
+    издержек — больше, чем сама маржа, которую мы ищем.
+    """
+
     pair_volume_usd: Dict[Tuple[str, str, str], float] = field(default_factory=dict)
     """(площадка, актив, актив) -> типичный оборот свечи в долларах.
 
@@ -88,6 +97,16 @@ class RateGrid:
 
     quality_notes: Dict[str, str] = field(default_factory=dict)
     """тикер -> почему он не участвует в расчёте (для интерфейса)"""
+
+    def fee_for(self, venue: str, kind: str, a: str, b: str) -> float:
+        """Комиссия плеча: своя у пула, иначе общая для площадки.
+
+        Один вход для сетки, разбора и диагностики — иначе они начнут
+        расходиться в третьем знаке, и доверять нельзя будет ни одному.
+        """
+        pool = self.pair_pool.get((venue, a, b))
+        own = self.pool_fee_pct.get(pool) if pool else None
+        return venue_fee_pct(venue, kind, own)
 
     @property
     def n_assets(self) -> int:
@@ -401,9 +420,20 @@ def build_grid(
     liq = df["liquidity_usd"].to_numpy(dtype=np.float64)
     vol = df["volume"].to_numpy(dtype=np.float64)
 
-    # комиссия на строку
+    # Комиссия на строку. Своя у пула, если источник её сообщил, —
+    # иначе общая для площадки. Разница не косметическая: уровни V3
+    # отличаются в сто раз, и пара стейблов на 0.01% считалась у нас
+    # по 0.25%.
+    # Справочник комиссий пулов: адрес -> процент. Пустой словарь
+    # означает лишь «источник уровня не сообщил» — тогда работает
+    # прежнее поведение, комиссия по площадке.
+    pool_fees = pool_fee_map(pools_df)
+
+    pool_col = (df["pool"].to_numpy() if "pool" in df.columns
+                else np.array([None] * len(df), dtype=object))
     fee = np.array([
-        venue_fee_pct(v, k) for v, k in zip(df["venue"].to_numpy(), kinds)
+        venue_fee_pct(v, k, pool_fees.get(p) if p is not None else None)
+        for v, k, p in zip(df["venue"].to_numpy(), kinds, pool_col)
     ], dtype=np.float64)
     fee_mult = 1.0 - fee / 100.0
 
@@ -452,6 +482,30 @@ def build_grid(
     return RateGrid(times=times, assets=asset_list, venues=venue_list,
                     log_rate=log_rate, venue_idx=venue_idx, trade_size_usd=trade,
                     quality_notes=quality_notes, **meta)
+
+
+def pool_fee_map(pools_df: Optional[pd.DataFrame]) -> Dict[str, float]:
+    """Адрес пула -> его собственная комиссия в процентах.
+
+    Отдельной функцией, потому что этим словарём пользуются трое: сетка
+    курсов, разбор по шагам и диагностика связки. Считать его в каждом
+    месте заново — верный способ развести их в третьем знаке.
+    """
+    out: Dict[str, float] = {}
+    if pools_df is None or pools_df.empty or "fee_pct" not in pools_df.columns:
+        return out
+    if "pool" not in pools_df.columns:
+        return out
+    for addr, fee_val in zip(pools_df["pool"], pools_df["fee_pct"]):
+        if addr is None or fee_val is None or fee_val != fee_val:
+            continue
+        try:
+            fee_val = float(fee_val)
+        except (TypeError, ValueError):
+            continue
+        if 0 < fee_val <= 100:
+            out[str(addr)] = fee_val
+    return out
 
 
 def _pools_frame(settings) -> Optional[pd.DataFrame]:
@@ -582,6 +636,7 @@ def _collect_meta(df: pd.DataFrame, settings,
 
     return {"venue_chain": venue_chain, "venue_kind": venue_kind,
             "pair_liquidity": pair_liquidity, "pair_pool": pair_pool,
+            "pool_fee_pct": pool_fee_map(pools_df),
             "pair_volume_usd": pair_volume_usd,
             "token_address": token_address, "token_name": token_name}
 
