@@ -198,6 +198,11 @@ class GeckoTerminalSource:
                 log.debug("%s: +%d пулов площадки %s", self.name, got, dex)
 
         # --- 3. Список наблюдения ------------------------------------------
+        # Пулы отсюда отмечаются: к ним применяется свой, низкий порог
+        # ликвидности и они не вытесняются квотой. Иначе список наблюдения
+        # был бы бесполезен ровно там, где он нужен: токен, не проходящий
+        # в топ по обороту, обычно и по размеру пула не проходит общий порог.
+        before_watch = len(pools)
         for token in load_watchlist(self.s):
             try:
                 payload = get_json(
@@ -212,13 +217,27 @@ class GeckoTerminalSource:
             got = take(payload)
             log.info("%s: список наблюдения, %s — пулов найдено %d",
                      self.name, token, got)
+        watched = {p["pool"] for p in pools[before_watch:]}
 
         # Отсев по ликвидности. Дальше — не просто «сто самых крупных»:
         # сначала каждой площадке отдаётся её квота, и лишь остаток лимита
         # разыгрывается по общему размеру. Иначе крупные пулы одной
         # площадки снова вытеснят всех остальных.
-        pools = [p for p in pools if (p["reserve_usd"] or 0) >= self.s.min_pool_reserve_usd]
-        pools = self._apply_venue_quota(pools)
+        floor_watch = float(getattr(self.s, "watch_min_reserve_usd",
+                                    self.s.min_pool_reserve_usd))
+        kept = []
+        for p in pools:
+            r = p["reserve_usd"] or 0
+            limit = floor_watch if p["pool"] in watched else self.s.min_pool_reserve_usd
+            if r >= limit:
+                kept.append(p)
+        dropped_watch = sum(1 for p in pools
+                            if p["pool"] in watched and p not in kept)
+        if dropped_watch:
+            log.info("%s: из списка наблюдения отсеяно по ликвидности: %d "
+                     "(порог $%s)", self.name, dropped_watch,
+                     f"{floor_watch:,.0f}".replace(",", " "))
+        pools = self._apply_venue_quota(kept, protected=watched)
         keep = {p["pool"] for p in pools}
 
         write_pools(pools)
@@ -236,7 +255,8 @@ class GeckoTerminalSource:
                  ", ".join(f"{d}:{n}" for d, n in top))
         return len(pools)
 
-    def _apply_venue_quota(self, pools: List[dict]) -> List[dict]:
+    def _apply_venue_quota(self, pools: List[dict],
+                           protected: Optional[set] = None) -> List[dict]:
         """Оставляет каждой площадке её квоту, остаток — по размеру пула.
 
         Без этого шага отбор «сто самых крупных» отдаёт весь список одной
@@ -244,14 +264,24 @@ class GeckoTerminalSource:
         """
         quota = max(0, int(getattr(self.s, "dex_venue_quota", 0)))
         limit = int(self.s.dex_pool_limit)
+        protected = protected or set()
 
         pools.sort(key=lambda p: p["reserve_usd"] or 0, reverse=True)
-        if not quota:
-            return pools[:limit]
 
-        chosen: List[dict] = []
+        # Пулы из списка наблюдения занимают места первыми: их запросили
+        # явно, и обрезать их по размеру — значит проигнорировать просьбу.
+        chosen: List[dict] = [p for p in pools if p["pool"] in protected]
+        limit = max(limit, len(chosen))
+        if not quota:
+            rest = [p for p in pools if p["pool"] not in protected]
+            return chosen + rest[: max(0, limit - len(chosen))]
+
         taken: Dict[str, int] = {}
+        for p in chosen:
+            taken[p["dex"]] = taken.get(p["dex"], 0) + 1
         for p in pools:
+            if p["pool"] in protected:
+                continue
             d = p["dex"]
             if taken.get(d, 0) < quota:
                 taken[d] = taken.get(d, 0) + 1
