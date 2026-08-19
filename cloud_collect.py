@@ -302,8 +302,12 @@ def main(argv=None) -> int:
             backfill_tried = True
             budget = min(120.0, next_pulse - now - 5.0, deadline - now)
             if budget > 20:
+                # Бюджет скромный намеренно: история пулов приятна, но
+                # живые срезы важнее, а квота у них общая. Бэкфилл с
+                # двадцатью пятью запросами выедал её и оставлял срезы
+                # без части пулов.
                 n = run_bounded("DEX backfill",
-                                lambda: c.dex.backfill(budget_requests=25),
+                                lambda: c.dex.backfill(budget_requests=8),
                                 budget, default=-1)
                 if n and n > 0:
                     log.info("DEX история: +%d свечей", n)

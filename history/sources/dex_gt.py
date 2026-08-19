@@ -460,14 +460,25 @@ class GeckoTerminalSource:
         now = int(time.time())
         tf_sec = self.s.timeframe_seconds()
         bucket = now - (now % tf_sec)
-        by_addr = {p["pool"]: p for p in pools}
-        addrs = list(by_addr)
+
+        # Порядок пачек важен: лимит GeckoTerminal считается по адресу, а на
+        # раннерах GitHub адрес общий, и часть пачек всё равно получит отказ
+        # независимо от нашей аккуратности. Значит терять надо не что попало:
+        # сначала идут пулы из списка наблюдения, затем самые крупные.
+        watch = {w.upper() for w in load_watchlist(self.s)}
+
+        def priority(p: dict) -> tuple:
+            in_watch = p.get("base") in watch or p.get("quote") in watch
+            return (0 if in_watch else 1, -(p.get("reserve_usd") or 0))
+
+        ordered = sorted(pools, key=priority)
+        addrs = [p["pool"] for p in ordered]
 
         candles: List[Candle] = []
         fresh: List[dict] = []
-        refused = 0
-        for i in range(0, len(addrs), MULTI_BATCH):
-            batch = addrs[i:i + MULTI_BATCH]
+        refused: List[List[str]] = []
+
+        def ask(batch: List[str], label: str) -> bool:
             try:
                 payload = get_json(
                     f"{self.api}/networks/{self.chain}/pools/multi/"
@@ -476,9 +487,8 @@ class GeckoTerminalSource:
                     headers=self.headers,
                 )
             except HttpError as exc:
-                refused += 1
-                log.warning("живой срез, пачка %d: %s", i // MULTI_BATCH + 1, exc)
-                continue
+                log.debug("живой срез, %s: %s", label, exc)
+                return False
             tokens = self._index_included(payload.get("included", []))
             for item in payload.get("data", []) or []:
                 parsed = self._parse_pool(item, tokens)
@@ -488,6 +498,30 @@ class GeckoTerminalSource:
                 snap = self._live_candle(parsed, bucket)
                 if snap:
                     candles.append(snap)
+            return True
+
+        for i in range(0, len(addrs), MULTI_BATCH):
+            batch = addrs[i:i + MULTI_BATCH]
+            if not ask(batch, f"пачка {i // MULTI_BATCH + 1}"):
+                refused.append(batch)
+
+        # Отказ по лимиту — не приговор: он снимается через несколько
+        # секунд. Один повтор возвращает те пулы, которые иначе выпали бы
+        # из среза целиком, а стоит он ровно столько же запросов.
+        if refused:
+            time.sleep(min(20.0, 4.0 * len(refused)))
+            still = []
+            for k, batch in enumerate(refused, 1):
+                if not ask(batch, f"повтор {k}"):
+                    still.append(batch)
+            if still:
+                log.warning("живой срез: %d пачек не отдались и после повтора "
+                            "(%d пулов без свежей цены)",
+                            len(still), sum(len(b) for b in still))
+            else:
+                log.info("живой срез: %d пачек взялись со второй попытки",
+                         len(refused))
+            refused = still
 
         if fresh:
             write_pools(fresh)
@@ -502,7 +536,8 @@ class GeckoTerminalSource:
                   error="" if written else "срез пуст")
         log.info("%s: живой срез — %d котировок по %d пулам%s",
                  self.name, written, len(addrs),
-                 f", отказов {refused}" if refused else "")
+                 f", без цены осталось {sum(len(b) for b in refused)}"
+                 if refused else "")
         return written
 
     # ------------------------------------------------------------ pool list
