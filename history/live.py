@@ -277,10 +277,16 @@ def _parse(payload: dict, chain: str, ts: int) -> List[dict]:
         if not base or not quote:
             continue
 
-        b_usd = _f(attrs.get("base_token_price_usd"))
-        q_usd = _f(attrs.get("quote_token_price_usd"))
-        if not b_usd or not q_usd or q_usd <= 0:
-            continue
+        # Курс самого пула, а не частное двух долларовых оценок: оценки
+        # снимаются в разные моменты, и на четырёхногой связке их
+        # расхождения складываются в маржу, которой нет.
+        rate = _f(attrs.get("base_token_price_quote_token"))
+        if not rate or rate <= 0:
+            b_usd = _f(attrs.get("base_token_price_usd"))
+            q_usd = _f(attrs.get("quote_token_price_usd"))
+            if not b_usd or not q_usd or q_usd <= 0:
+                continue
+            rate = b_usd / q_usd
 
         out.append({
             "ts": ts,
@@ -289,7 +295,7 @@ def _parse(payload: dict, chain: str, ts: int) -> List[dict]:
             "chain": chain,
             "base": norm_asset(base),
             "quote": norm_asset(quote),
-            "close": b_usd / q_usd,
+            "close": rate,
             "volume": None,
             "liquidity_usd": _f(attrs.get("reserve_in_usd")),
             "pool": attrs.get("address"),

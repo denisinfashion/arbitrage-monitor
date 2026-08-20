@@ -469,19 +469,44 @@ class GeckoTerminalSource:
             "volume_24h": _f((attrs.get("volume_usd") or {}).get("h24")),
             "fee_pct": _pool_fee_pct(attrs, dex_id),
             # не пишется в таблицу pools, используется ниже
+            "_ratio": _f(attrs.get("base_token_price_quote_token")),
             "_base_usd": _f(attrs.get("base_token_price_usd")),
             "_quote_usd": _f(attrs.get("quote_token_price_usd")),
         }
 
     def _live_candle(self, pool: dict, ts: int) -> Optional[Candle]:
-        """Текущая цена из top-pools как свеча текущего интервала."""
-        b, q = pool.get("_base_usd"), pool.get("_quote_usd")
-        if not b or not q or q <= 0:
-            return None
+        """Текущая цена пула как свеча текущего интервала.
+
+        Курс берётся из собственного поля пула, а не делением двух
+        долларовых оценок. Разница принципиальная, и она стоила нам
+        потока ложных оповещений.
+
+        Долларовая цена токена у источника — это оценка: она считается
+        по самому ликвидному пулу и обновляется своим темпом. У одного
+        и того же токена в двух разных пулах она отличается на сотые
+        доли процента просто потому, что снята в разные моменты. Пока
+        плечо одно, это незаметно. Но связка перемножает четыре курса,
+        и четыре независимые погрешности складываются в «маржу» в треть
+        процента, которой на рынке нет. Именно так рождались связки
+        USDT → BNB → ETH → BTC → USDT целиком внутри PancakeSwap,
+        якобы живущие по пятнадцать минут: настоящий треугольный
+        арбитраж между топовыми пулами закрывают боты за один блок.
+
+        `base_token_price_quote_token` — это отношение самого пула,
+        без посредника в виде доллара. Деление долларовых оценок
+        остаётся запасным путём: лучше приблизительный курс, чем
+        никакого.
+        """
+        rate = pool.get("_ratio")
+        if not rate or rate <= 0:
+            b, q = pool.get("_base_usd"), pool.get("_quote_usd")
+            if not b or not q or q <= 0:
+                return None
+            rate = b / q
         return Candle(
             ts=ts, venue=pool["dex"], venue_kind="dex", chain=self.chain,
             base=pool["base"], quote=pool["quote"],
-            close=b / q, liquidity_usd=pool["reserve_usd"], pool=pool["pool"],
+            close=rate, liquidity_usd=pool["reserve_usd"], pool=pool["pool"],
         )
 
     # ---------------------------------------------------------------- pulse

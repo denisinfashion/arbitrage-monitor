@@ -37,8 +37,9 @@ import pandas as pd
 
 from .config import (SETTINGS, dex_fee_pct, is_concentrated, is_stable,
                      norm_asset)
-from .rates import (cex_slippage_factor, dex_depth_usd, dex_slippage_factor,
-                    pool_fee_map, venue_fee_pct)
+from .rates import (asset_tax_map, cex_slippage_factor, dex_depth_usd,
+                    dex_slippage_factor, leg_tax_factor, pool_fee_map,
+                    venue_fee_pct)
 
 
 @dataclass
@@ -59,6 +60,9 @@ class LegReport:
     depth_usd: Optional[float] = None
     slip_pct: float = 0.0
     concentrated: bool = False
+    tax_pct: float = 0.0
+    """Налог контракта на этом плече: удержание при продаже `frm` плюс
+    удержание при покупке `to`. В цене пула его не видно."""
     alternatives: int = 0
     note: str = ""
 
@@ -68,8 +72,8 @@ class LegReport:
 
     @property
     def cost_pct(self) -> float:
-        """Полная издержка плеча в процентах: комиссия плюс проскальзывание."""
-        return self.fee_pct + self.slip_pct
+        """Полная издержка плеча: комиссия, проскальзывание и налог."""
+        return self.fee_pct + self.slip_pct + self.tax_pct
 
 
 @dataclass
@@ -86,6 +90,7 @@ class ChainReport:
     """Маржа после комиссий и проскальзывания."""
     fees_pct: float = 0.0
     slip_pct: float = 0.0
+    tax_pct: float = 0.0
     verdict: str = ""
     stage: str = ""
     """Короткий код шага, на котором связка выпала."""
@@ -145,13 +150,22 @@ def _rows_for(quotes: pd.DataFrame, a: str, b: str) -> pd.DataFrame:
     return out[out["_rate"].notna() & (out["_rate"] > 0)]
 
 
-def pool_fees(settings=SETTINGS) -> dict:
-    """Комиссии пулов из справочника. Пусто, если справочник недоступен."""
+def _pools(settings=SETTINGS):
     try:
         from . import snapshot
-        return pool_fee_map(snapshot.pools(settings.chain))
+        return snapshot.pools(settings.chain)
     except Exception:  # noqa: BLE001 — справочник необязателен
-        return {}
+        return None
+
+
+def pool_fees(settings=SETTINGS) -> dict:
+    """Комиссии пулов из справочника. Пусто, если справочник недоступен."""
+    return pool_fee_map(_pools(settings))
+
+
+def asset_taxes(settings=SETTINGS) -> dict:
+    """Налоги контрактов по тикерам. Пусто, если проверок ещё не было."""
+    return asset_tax_map(_pools(settings))
 
 
 def _leg_cost(row, a: str, b: str, trade_usd: float, settings,
@@ -268,7 +282,8 @@ def diagnose(chain: List[str], quotes: pd.DataFrame, trade_usd: float = 1000.0,
              window_h: float = 6.0, settings=SETTINGS,
              venue_kinds: Optional[List[str]] = None,
              route: bool = True, max_age_sec: Optional[float] = 900.0,
-             fees: Optional[dict] = None) -> ChainReport:
+             fees: Optional[dict] = None,
+             taxes: Optional[dict] = None) -> ChainReport:
     """Проходит связку плечо за плечом и объясняет результат.
 
     `venue_kinds` ограничивает площадки. Это не украшение: связка,
@@ -290,6 +305,8 @@ def diagnose(chain: List[str], quotes: pd.DataFrame, trade_usd: float = 1000.0,
 
     if fees is None:
         fees = pool_fees(settings)
+    if taxes is None:
+        taxes = asset_taxes(settings)
 
     if route and not quotes.empty:
         chain, rep.routed = expand_route(chain, quotes, trade_usd, settings,
@@ -343,12 +360,17 @@ def diagnose(chain: List[str], quotes: pd.DataFrame, trade_usd: float = 1000.0,
             slip = cex_slippage_factor(trade_usd, leg.volume_usd)
         leg.slip_pct = (1.0 - slip) * 100.0
 
+        tax_factor = leg_tax_factor(taxes, a, b, leg.venue_kind)
+        leg.tax_pct = (1.0 - tax_factor) * 100.0
+
         product *= leg.price
-        net_product *= leg.price * (1.0 - leg.fee_pct / 100.0) * slip
+        net_product *= (leg.price * (1.0 - leg.fee_pct / 100.0) * slip
+                        * tax_factor)
         rep.legs.append(leg)
 
     rep.fees_pct = sum(l.fee_pct for l in rep.legs if l.found)
     rep.slip_pct = sum(l.slip_pct for l in rep.legs if l.found)
+    rep.tax_pct = sum(l.tax_pct for l in rep.legs if l.found)
 
     if rep.missing:
         rep.stage = "no_quotes"
@@ -387,6 +409,17 @@ def diagnose(chain: List[str], quotes: pd.DataFrame, trade_usd: float = 1000.0,
             f"разница меньше стоимости обменов.")
         return rep
 
+    if rep.net_pct <= 0 and rep.tax_pct > 0 and (
+            rep.spot_pct - rep.fees_pct - rep.slip_pct > 0):
+        rep.stage = "tax"
+        rep.verdict = (
+            f"Спот {rep.spot_pct:+.2f}%, комиссии {rep.fees_pct:.2f}%, "
+            f"проскальзывание {rep.slip_pct:.2f}% — связка выжила бы, но "
+            f"налог контрактов {rep.tax_pct:.2f}% забирает остаток. Этот "
+            f"процент удерживает сам токен при переводе, в цене пула его "
+            f"не видно.")
+        return rep
+
     if rep.net_pct <= 0:
         rep.stage = "slippage"
         rep.verdict = (
@@ -420,6 +453,7 @@ def legs_frame(rep: ChainReport) -> pd.DataFrame:
                                                l.venue_kind == "dex" else ""),
             "Комиссия, %": round(l.fee_pct, 3) if l.found else None,
             "Проскальзывание, %": round(l.slip_pct, 3) if l.found else None,
+            "Налог, %": round(l.tax_pct, 3) if l.found else None,
             "Итого издержки, %": round(l.cost_pct, 3) if l.found else None,
             "Замечание": l.note,
         })

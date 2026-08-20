@@ -276,7 +276,7 @@ def load_watchlist(settings=None) -> List[str]:
     return out
 
 
-CODE_VERSION = "2026-08-19.14"
+CODE_VERSION = "2026-08-20.1"
 """Отметка версии модулей.
 
 Нужна из-за реального случая: при распаковке обновления поверх папки

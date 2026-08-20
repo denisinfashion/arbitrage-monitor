@@ -29,7 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from history import live, store
+from history import live, store, taxes
 from history.config import (CODE_VERSION, DATA_DIR, SETTINGS,
                             ensure_data_dir)
 from history.snapshot import export_snapshot, import_snapshot
@@ -74,6 +74,40 @@ def publish_live(source) -> None:
         log.info("свежие цены опубликованы: %d котировок", len(rows))
     else:
         log.info("свежие цены записаны локально: %d котировок", len(rows))
+
+
+
+def check_contracts(source, seconds: float) -> None:
+    """Проверяет контракты токенов из справочника на налог при переводе.
+
+    Ставится после поиска пулов и до бирж: список токенов к этому моменту
+    известен, а проверка идёт к чужому источнику и может тормозить.
+    Бюджет жёсткий — непроверенный токен подождёт до следующего прогона,
+    сорванный прогон не подождёт.
+    """
+    if seconds < 10:
+        return
+    pools = list(getattr(source, "pools", []) or [])
+    if not pools:
+        return
+    # Сперва крупные пулы: если бюджета не хватит, непроверенным останется
+    # то, чем и торговать бы не стали.
+    pools.sort(key=lambda p: -(p.get("reserve_usd") or 0.0))
+    addrs = []
+    for p in pools:
+        for key in ("base_addr", "quote_addr"):
+            a = (p.get(key) or "").strip().lower()
+            if a and a not in addrs:
+                addrs.append(a)
+    if not addrs:
+        return
+    budget = int(os.environ.get("ARB_RISK_BUDGET", "40"))
+    known = taxes.refresh(addrs, SETTINGS.chain, budget=budget,
+                          deadline=time.time() + seconds)
+    bad = [r for r in known.values() if not r.tradable]
+    taxed = [r for r in known.values() if r.tradable and r.round_trip_pct > 0]
+    log.info("контракты: известно %d, с налогом %d, торговать нельзя %d",
+             len(known), len(taxed), len(bad))
 
 
 def run_bounded(label: str, fn, seconds: float, default=0):
@@ -232,6 +266,12 @@ def main(argv=None) -> int:
             log.info("справочник пулов свежий — полный поиск пропущен")
             run_bounded("DEX срез", c.dex.pulse, min(90.0, left()))
         publish_live(c.dex)
+        # Налог на перевод не виден в цене: контракт удерживает процент
+        # при обмене, и связка, прибыльная по котировкам, оказывается
+        # убыточной. Проверяем симуляцией обмена, результат живёт сутки.
+        run_bounded("Проверка контрактов",
+                    lambda: check_contracts(c.dex, min(90.0, left())),
+                    min(100.0, left()))
 
     # Биржи: discover каждой ограничен, чтобы недоступная площадка
     # не съела прогон целиком.

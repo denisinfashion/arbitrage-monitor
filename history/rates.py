@@ -98,6 +98,14 @@ class RateGrid:
     quality_notes: Dict[str, str] = field(default_factory=dict)
     """тикер -> почему он не участвует в расчёте (для интерфейса)"""
 
+    asset_tax: Dict[str, tuple] = field(default_factory=dict)
+    """тикер -> (налог на покупку %, налог на продажу %, можно ли торговать).
+
+    Налог удерживает сам контракт токена при переводе, и в цене пула его
+    не видно. Связка USDT → SPCXB → MARSCOIN → USDT показывала +0.363%
+    и была убыточной ровно поэтому.
+    """
+
     def fee_for(self, venue: str, kind: str, a: str, b: str) -> float:
         """Комиссия плеча: своя у пула, иначе общая для площадки.
 
@@ -337,6 +345,14 @@ def build_grid(
                          int(bad.sum()), screen.summary())
                 df = df[~bad]
         quality_notes = dict(screen.notes)
+        # Токены, которые нельзя продать, отсекаются здесь же. Это не
+        # «подозрительно», а «симуляция обмена не прошла»: honeypot,
+        # заблокированная продажа, налог в десятки процентов. Считать
+        # по ним связку бессмысленно — она не исполнится ни при каком
+        # спреде, и место в списке активов займёт зря.
+        for sym, why in _untradable_symbols(pools_df).items():
+            quality_notes.setdefault(sym, why)
+
         if quality_notes:
             drop = set(quality_notes)
             df = df[~df["base"].isin(drop) & ~df["quote"].isin(drop)]
@@ -454,11 +470,30 @@ def build_grid(
     else:
         slip = np.ones(len(df), dtype=np.float64)
 
+    # Налог на перевод. Считается отдельно по направлениям, и это не
+    # придирка: в обмене a -> b токен `a` продаётся, токен `b` покупается,
+    # а ставки у них разные и принадлежат разным контрактам. До сих пор
+    # издержка была одна на обе стороны строки, потому что комиссия
+    # и проскальзывание симметричны. Налог — нет.
+    taxes = asset_tax_map(pools_df)
+    if taxes:
+        tax_fwd = np.array([leg_tax_factor(taxes, str(a), str(b), k)
+                            for a, b, k in zip(df["base"].to_numpy(),
+                                               df["quote"].to_numpy(), kinds)],
+                           dtype=np.float64)
+        tax_bwd = np.array([leg_tax_factor(taxes, str(b), str(a), k)
+                            for a, b, k in zip(df["base"].to_numpy(),
+                                               df["quote"].to_numpy(), kinds)],
+                           dtype=np.float64)
+    else:
+        tax_fwd = tax_bwd = np.ones(len(df), dtype=np.float64)
+
     eff = fee_mult * slip
     valid = (price > 0) & (eff > 0)
 
-    fwd = np.log(np.where(valid, price * eff, 1.0))        # base -> quote
-    bwd = np.log(np.where(valid, (1.0 / np.where(price > 0, price, 1.0)) * eff, 1.0))
+    fwd = np.log(np.where(valid, price * eff * tax_fwd, 1.0))       # base -> quote
+    bwd = np.log(np.where(valid, (1.0 / np.where(price > 0, price, 1.0))
+                          * eff * tax_bwd, 1.0))
 
     # Разворачиваем в сетку, оставляя лучший курс среди площадок.
     _scatter_max(log_rate, venue_idx, ti[valid], bi[valid], qi[valid], fwd[valid], vi[valid])
@@ -482,6 +517,66 @@ def build_grid(
     return RateGrid(times=times, assets=asset_list, venues=venue_list,
                     log_rate=log_rate, venue_idx=venue_idx, trade_size_usd=trade,
                     quality_notes=quality_notes, **meta)
+
+
+def _untradable_symbols(pools_df: Optional[pd.DataFrame]) -> Dict[str, str]:
+    """Тикер -> почему по нему нельзя торговать, по проверке контракта."""
+    out: Dict[str, str] = {}
+    if pools_df is None or pools_df.empty:
+        return out
+    for side in ("base", "quote"):
+        cols = (side, f"{side}_tradable", f"{side}_risk_note")
+        if not all(c in pools_df.columns for c in cols):
+            continue
+        for sym, ok, note in zip(*(pools_df[c] for c in cols)):
+            sym = str(sym or "").upper()
+            if not sym or ok is None or ok != ok or bool(ok):
+                continue
+            out[sym] = str(note or "продать нельзя: проверка контракта")
+    return out
+
+
+def asset_tax_map(pools_df: Optional[pd.DataFrame]) -> Dict[str, tuple]:
+    """Тикер -> (налог на покупку, налог на продажу, можно ли торговать).
+
+    Берётся из справочника пулов: проверка контракта едет вместе с ним,
+    продублированная на каждую строку. Тикер, а не адрес, потому что
+    сетка курсов оперирует тикерами; подделку с чужим адресом отсеивает
+    отбор качества раньше, до этого места.
+    """
+    out: Dict[str, tuple] = {}
+    if pools_df is None or pools_df.empty:
+        return out
+    for side in ("base", "quote"):
+        cols = (side, f"{side}_tax_buy", f"{side}_tax_sell", f"{side}_tradable")
+        if not all(c in pools_df.columns for c in cols):
+            continue
+        for sym, buy, sell, ok in zip(*(pools_df[c] for c in cols)):
+            sym = str(sym or "").upper()
+            if not sym or buy is None or buy != buy:
+                continue
+            tradable = True if ok is None or ok != ok else bool(ok)
+            out[sym] = (float(buy or 0.0), float(sell or 0.0), tradable)
+    return out
+
+
+def leg_tax_factor(taxes: Dict[str, tuple], sell_asset: str, buy_asset: str,
+                   kind: str) -> float:
+    """Множитель к курсу плеча из-за налогов контрактов.
+
+    На бирже налога нет: там торгуется запись в базе биржи, а не токен
+    в сети, и контракт при этом не вызывается.
+    """
+    if kind != "dex":
+        return 1.0
+    factor = 1.0
+    out = taxes.get(str(sell_asset).upper())
+    if out and out[1] > 0:
+        factor *= max(0.0, 1.0 - out[1] / 100.0)
+    inn = taxes.get(str(buy_asset).upper())
+    if inn and inn[0] > 0:
+        factor *= max(0.0, 1.0 - inn[0] / 100.0)
+    return factor
 
 
 def pool_fee_map(pools_df: Optional[pd.DataFrame]) -> Dict[str, float]:
@@ -637,6 +732,7 @@ def _collect_meta(df: pd.DataFrame, settings,
     return {"venue_chain": venue_chain, "venue_kind": venue_kind,
             "pair_liquidity": pair_liquidity, "pair_pool": pair_pool,
             "pool_fee_pct": pool_fee_map(pools_df),
+            "asset_tax": asset_tax_map(pools_df),
             "pair_volume_usd": pair_volume_usd,
             "token_address": token_address, "token_name": token_name}
 

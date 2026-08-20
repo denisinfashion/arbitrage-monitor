@@ -38,3 +38,7 @@ jobs:
         run: python -m history.tests.test_scale
       - name: Свежие цены и глубина пулов
         run: python -m history.tests.test_live
+      - name: Налог на перевод
+        run: python -m history.tests.test_taxes
+      - name: Откуда берётся курс пула
+        run: python -m history.tests.test_prices

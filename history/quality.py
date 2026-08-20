@@ -362,6 +362,14 @@ def credible_assets(grid) -> Set[str]:
     for table in CANONICAL.values():
         known.update(table.keys())
 
+    # Проверенный контракт снимает вопрос напрямую, без косвенных
+    # признаков: если симуляция обмена прошла и налога нет, листинг
+    # на бирже больше ничего не добавляет. Косвенный признак остаётся
+    # для токенов, до которых проверка не дошла.
+    for sym, (buy, sell, tradable) in getattr(grid, "asset_tax", {}).items():
+        if tradable and buy <= 0 and sell <= 0:
+            known.add(str(sym).upper())
+
     for (venue, a, b) in getattr(grid, "pair_liquidity", {}):
         if grid.venue_kind.get(venue) == "cex":
             known.add(a)
@@ -390,4 +398,24 @@ def exotic_in(cycle, known: Optional[Set[str]] = None) -> List[str]:
             continue
         seen.add(a)
         out.append(a)
+    return out
+
+
+def taxed_in(cycle, min_pct: float = 0.0) -> Dict[str, float]:
+    """Активы связки с налогом на перевод: тикер -> суммарный налог, %.
+
+    Отдельно от «неизвестных»: налог — это издержка, она уже вычтена
+    из маржи. Список нужен, чтобы её было видно в оповещении, а не
+    чтобы что-то запрещать.
+    """
+    taxes = getattr(getattr(cycle, "grid", None), "asset_tax", {}) or {}
+    out = {}
+    for a in getattr(cycle, "assets", ()):  # noqa: B007
+        a = str(a).upper()
+        row = taxes.get(a)
+        if not row:
+            continue
+        total = float(row[0]) + float(row[1])
+        if total > min_pct:
+            out[a] = total
     return out

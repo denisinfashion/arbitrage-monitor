@@ -159,6 +159,7 @@ def pick(cycles: Sequence, cfg: AlertConfig, sent: dict) -> List:
     out = []
     wild = []
     exotic_seen = []
+    untradable_seen = []
     known = None
     seen_keys = set()
     for c in cycles:
@@ -180,6 +181,16 @@ def pick(cycles: Sequence, cfg: AlertConfig, sent: dict) -> List:
         if cfg.require_single_chain and c.needs_transfer():
             continue
 
+        # Проверка контракта — прямая, и она сильнее косвенных признаков.
+        # Токен, из которого симуляция не смогла выйти, не спасёт никакой
+        # спред: связка не исполнится вовсе.
+        tax_map = getattr(c.grid, "asset_tax", None) or {}
+        blocked = [a for a in c.assets
+                   if not tax_map.get(str(a).upper(), (0.0, 0.0, True))[2]]
+        if blocked:
+            untradable_seen.append((c.label, sorted(set(blocked))))
+            continue
+
         if cfg.require_known_tokens:
             from .quality import credible_assets, exotic_in
             if known is None:
@@ -195,6 +206,11 @@ def pick(cycles: Sequence, cfg: AlertConfig, sent: dict) -> List:
         seen_keys.add(key)
 
         out.append((now_margin, c))
+
+    if untradable_seen:
+        log.warning(
+            "не отправлено: продать токен нельзя по проверке контракта — %s",
+            "; ".join(f"{lbl} ({', '.join(u)})" for lbl, u in untradable_seen[:5]))
 
     if exotic_seen:
         log.warning(
@@ -238,6 +254,20 @@ def format_message(cycle, margin: float) -> str:
         lines.append(f"Сеть: {esc(chain_name(chain))} · переводы не нужны")
     if liq:
         lines.append(f"Узкое место по ликвидности: ${liq:,.0f}".replace(",", " "))
+
+    # Налог показываем явно, хотя он уже вычтен из маржи. Человеку важно
+    # знать, что часть суммы удержит сам контракт токена, а не площадка:
+    # в кошельке это будет выглядеть как недостача, а не как комиссия.
+    try:
+        from .quality import taxed_in
+        taxed = taxed_in(cycle)
+    except Exception:  # noqa: BLE001
+        taxed = {}
+    if taxed:
+        lines.append("Налог контракта (уже учтён): "
+                     + ", ".join(f"{esc(k)} {v:.1f}%"
+                                 for k, v in sorted(taxed.items(),
+                                                    key=lambda kv: -kv[1])))
 
     stats = cycle.stats()
     window = stats.get("Окно средн, мин")

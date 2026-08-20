@@ -86,9 +86,45 @@ def export_snapshot(path: Optional[Path] = None, days: Optional[float] = None) -
 def _all_pools() -> pd.DataFrame:
     conn = store.connect(read_only=True)
     try:
-        return pd.read_sql_query("SELECT * FROM pools", conn)
+        pools = pd.read_sql_query("SELECT * FROM pools", conn)
     except Exception:
         return pd.DataFrame(columns=["chain", "pool", "dex", "base", "quote"])
+    return _with_token_risk(pools)
+
+
+def _with_token_risk(pools: pd.DataFrame) -> pd.DataFrame:
+    """Подмешивает к пулам проверку контрактов обеих сторон пары.
+
+    Проверка привязана к адресу токена, а снимок состоит из двух файлов,
+    и заводить третий ради двух колонок не хочется: каждый лишний файл —
+    это ещё одно место, где облако может оказаться со старыми данными.
+    Поэтому налог едет вместе со справочником пулов, продублированный
+    на каждую строку. Двести строк — цена, которую не жалко.
+    """
+    if pools.empty or "base_addr" not in pools.columns:
+        return pools
+    try:
+        risks = {}
+        for chain in pools["chain"].dropna().unique():
+            risks.update(store.read_token_risk(str(chain)))
+    except Exception as exc:  # noqa: BLE001 — проверка необязательна
+        log.debug("проверки контрактов недоступны: %s", exc)
+        return pools
+    if not risks:
+        return pools
+
+    def pick(addr, field, default):
+        r = risks.get(str(addr or "").strip().lower())
+        return getattr(r, field) if r is not None else default
+
+    pools = pools.copy()
+    for side in ("base", "quote"):
+        col = f"{side}_addr"
+        pools[f"{side}_tax_buy"] = [pick(a, "buy_pct", None) for a in pools[col]]
+        pools[f"{side}_tax_sell"] = [pick(a, "sell_pct", None) for a in pools[col]]
+        pools[f"{side}_tradable"] = [pick(a, "tradable", None) for a in pools[col]]
+        pools[f"{side}_risk_note"] = [pick(a, "reason", "") for a in pools[col]]
+    return pools
 
 
 # --------------------------------------------------------------------------

@@ -69,6 +69,25 @@ CREATE TABLE IF NOT EXISTS pools (
     PRIMARY KEY (chain, pool)
 );
 
+-- Проверка контрактов: налог на перевод и возможность продажи.
+-- Живёт отдельно от пулов, потому что привязана к токену, а не к паре,
+-- и потому что источник у неё свой — симуляция обмена, а не котировки.
+CREATE TABLE IF NOT EXISTS token_risk (
+    chain         TEXT NOT NULL,
+    address       TEXT NOT NULL,
+    symbol        TEXT,
+    buy_pct       REAL,
+    sell_pct      REAL,
+    transfer_pct  REAL,
+    honeypot      INTEGER,
+    tradable      INTEGER,
+    reason        TEXT,
+    risk_level    INTEGER,
+    open_source   INTEGER,
+    checked_at    INTEGER,
+    PRIMARY KEY (chain, address)
+);
+
 -- Газ и цена нативной монеты сети.
 CREATE TABLE IF NOT EXISTS gas (
     ts             INTEGER NOT NULL,
@@ -356,6 +375,61 @@ def read_pools(chain: str, min_reserve_usd: float = 0.0) -> pd.DataFrame:
         "ORDER BY reserve_usd DESC",
         conn, params=(chain, min_reserve_usd),
     )
+
+
+def write_token_risk(rows) -> int:
+    """Сохраняет проверки контрактов. Повторная проверка заменяет прежнюю."""
+    sql = """
+    INSERT INTO token_risk (chain, address, symbol, buy_pct, sell_pct,
+                            transfer_pct, honeypot, tradable, reason,
+                            risk_level, open_source, checked_at)
+    VALUES (:chain,:address,:symbol,:buy_pct,:sell_pct,:transfer_pct,
+            :honeypot,:tradable,:reason,:risk_level,:open_source,:checked_at)
+    ON CONFLICT (chain, address) DO UPDATE SET
+        symbol=excluded.symbol, buy_pct=excluded.buy_pct,
+        sell_pct=excluded.sell_pct, transfer_pct=excluded.transfer_pct,
+        honeypot=excluded.honeypot, tradable=excluded.tradable,
+        reason=excluded.reason, risk_level=excluded.risk_level,
+        open_source=excluded.open_source, checked_at=excluded.checked_at
+    """
+    payload = []
+    for r in rows:
+        payload.append({
+            "chain": r.chain, "address": r.address.lower(), "symbol": r.symbol,
+            "buy_pct": r.buy_pct, "sell_pct": r.sell_pct,
+            "transfer_pct": r.transfer_pct, "honeypot": int(r.honeypot),
+            "tradable": int(r.tradable), "reason": r.reason,
+            "risk_level": r.risk_level, "open_source": int(r.open_source),
+            "checked_at": r.checked_at,
+        })
+    if not payload:
+        return 0
+    with transaction() as conn:
+        conn.executemany(sql, payload)
+    return len(payload)
+
+
+def read_token_risk(chain: str) -> Dict[str, "object"]:
+    """Проверки контрактов сети: адрес -> TokenRisk."""
+    from .taxes import TokenRisk
+    try:
+        rows = connect(read_only=True).execute(
+            "SELECT * FROM token_risk WHERE chain=?", (chain,)).fetchall()
+    except Exception:  # noqa: BLE001 — таблицы может ещё не быть
+        return {}
+    out = {}
+    for r in rows:
+        out[str(r["address"]).lower()] = TokenRisk(
+            address=str(r["address"]).lower(), chain=str(r["chain"]),
+            symbol=str(r["symbol"] or ""), buy_pct=float(r["buy_pct"] or 0.0),
+            sell_pct=float(r["sell_pct"] or 0.0),
+            transfer_pct=float(r["transfer_pct"] or 0.0),
+            honeypot=bool(r["honeypot"]), tradable=bool(r["tradable"]),
+            reason=str(r["reason"] or ""), risk_level=int(r["risk_level"] or 0),
+            open_source=bool(r["open_source"]),
+            checked_at=int(r["checked_at"] or 0),
+        )
+    return out
 
 
 def read_fees() -> Dict[str, float]:
