@@ -44,3 +44,5 @@ jobs:
         run: python -m history.tests.test_prices
       - name: Кандидаты в связки фьючерс ↔ DEX
         run: python -m history.tests.test_leadlag_universe
+      - name: Сбор сделок и поиск лага
+        run: python -m history.tests.test_leadlag_lag

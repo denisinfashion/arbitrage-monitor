@@ -45,6 +45,16 @@ class ScreenSettings:
     # Контроль сопоставления: цены фьючерса и пула — один и тот же актив.
     max_price_gap_pct: float = 3.0
 
+    # Сбор сделок (ticks.py): сколько монет из прошедших фильтры вести
+    # (крупнейшие по объёму фьючерса) и сколько дней хранить посекундные цены.
+    track_max_coins: int = 40
+    keep_days: float = 3.0
+
+    # Поиск лага (lag.py)
+    lag_window_hours: int = 24     # за сколько часов оценивать устойчивость
+    max_lag_s: int = 60            # сдвиги от −max до +max секунд
+    min_corr: float = 0.10         # пик корреляции слабее — связи нет
+
     @classmethod
     def load(cls, path: Path = SETTINGS_PATH) -> "ScreenSettings":
         try:

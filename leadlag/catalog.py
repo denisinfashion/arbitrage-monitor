@@ -14,17 +14,18 @@ from typing import Dict, Optional
 class FuturesVenue:
     key: str            # имя в интерфейсе и в данных
     ccxt_id: str        # класс ccxt
-    options: dict       # опции ccxt (тип рынка по умолчанию)
+    options: dict       # опции ccxt: тип рынка по умолчанию и загрузка только фьючерсов —
+                        # справочник спота и опционов занимает сотни мегабайт
     url: str            # шаблон ссылки на торговую страницу, {id} — id рынка
 
 
 FUTURES: Dict[str, FuturesVenue] = {v.key: v for v in [
     FuturesVenue("binance", "binanceusdm", {}, "https://www.binance.com/en/futures/{id}"),
-    FuturesVenue("bybit", "bybit", {"defaultType": "swap"}, "https://www.bybit.com/trade/usdt/{id}"),
-    FuturesVenue("okx", "okx", {"defaultType": "swap"}, "https://www.okx.com/trade-swap/{id_lower}"),
-    FuturesVenue("gate", "gate", {"defaultType": "swap"}, "https://www.gate.com/futures/USDT/{id}"),
-    FuturesVenue("bitget", "bitget", {"defaultType": "swap"}, "https://www.bitget.com/futures/usdt/{id}"),
-    FuturesVenue("mexc", "mexc", {"defaultType": "swap"}, "https://futures.mexc.com/exchange/{id}"),
+    FuturesVenue("bybit", "bybit", {"defaultType": "swap", "fetchMarkets": {"types": ["linear"]}}, "https://www.bybit.com/trade/usdt/{id}"),
+    FuturesVenue("okx", "okx", {"defaultType": "swap", "fetchMarkets": {"types": ["swap"]}}, "https://www.okx.com/trade-swap/{id_lower}"),
+    FuturesVenue("gate", "gate", {"defaultType": "swap", "fetchMarkets": {"types": ["swap"]}}, "https://www.gate.com/futures/USDT/{id}"),
+    FuturesVenue("bitget", "bitget", {"defaultType": "swap", "fetchMarkets": {"types": ["swap"]}}, "https://www.bitget.com/futures/usdt/{id}"),
+    FuturesVenue("mexc", "mexc", {"defaultType": "swap", "fetchMarkets": {"types": {"spot": False, "swap": {"linear": True, "inverse": False}}}}, "https://futures.mexc.com/exchange/{id}"),
     FuturesVenue("kucoin", "kucoinfutures", {}, "https://www.kucoin.com/futures/trade/{id}"),
     FuturesVenue("bingx", "bingx", {"defaultType": "swap"}, "https://bingx.com/en/perpetual/{id}/"),
 ]}
@@ -55,21 +56,22 @@ class Chain:
     label: str
     coingecko: str      # ключ платформы в CoinGecko /coins/list?include_platform
     dexscreener: str    # chainId в DexScreener
+    geckoterminal: str  # id сети в GeckoTerminal (лента сделок пула)
     block_s: float      # типичное время блока — точность метки времени свопа
     evm: bool = True    # EVM-адреса сравниваются без учёта регистра
 
 
 CHAINS: Dict[str, Chain] = {c.key: c for c in [
-    Chain("bsc", "BNB Chain", "binance-smart-chain", "bsc", 0.75),
-    Chain("solana", "Solana", "solana", "solana", 0.4, evm=False),
-    Chain("base", "Base", "base", "base", 2.0),
-    Chain("arbitrum", "Arbitrum", "arbitrum-one", "arbitrum", 0.25),
-    Chain("tron", "Tron", "tron", "tron", 3.0, evm=False),
-    Chain("sui", "Sui", "sui", "sui", 0.5, evm=False),
-    Chain("ton", "TON", "the-open-network", "ton", 5.0, evm=False),
-    Chain("avalanche", "Avalanche", "avalanche", "avalanche", 2.0),
-    Chain("polygon", "Polygon", "polygon-pos", "polygon", 2.0),
-    Chain("ethereum", "Ethereum", "ethereum", "ethereum", 12.0),
+    Chain("bsc", "BNB Chain", "binance-smart-chain", "bsc", "bsc", 0.75),
+    Chain("solana", "Solana", "solana", "solana", "solana", 0.4, evm=False),
+    Chain("base", "Base", "base", "base", "base", 2.0),
+    Chain("arbitrum", "Arbitrum", "arbitrum-one", "arbitrum", "arbitrum", 0.25),
+    Chain("tron", "Tron", "tron", "tron", "tron", 3.0, evm=False),
+    Chain("sui", "Sui", "sui", "sui", "sui-network", 0.5, evm=False),
+    Chain("ton", "TON", "the-open-network", "ton", "ton", 5.0, evm=False),
+    Chain("avalanche", "Avalanche", "avalanche", "avalanche", "avax", 2.0),
+    Chain("polygon", "Polygon", "polygon-pos", "polygon", "polygon_pos", 2.0),
+    Chain("ethereum", "Ethereum", "ethereum", "ethereum", "eth", 12.0),
 ]}
 # Ethereum по умолчанию выключен: блок раз в 12 с — лаг в несколько секунд не виден.
 CHAINS_DEFAULT = ["bsc", "solana", "base", "arbitrum", "tron", "sui"]

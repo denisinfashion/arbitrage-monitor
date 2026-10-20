@@ -38,5 +38,23 @@ services:
     healthcheck:
       disable: true   # проверка из образа — для интерфейса, у сборщика порта нет
 
+  # Сделки по кандидатам (WebSocket бирж, блокчейн BSC/Base/Arbitrum, GeckoTerminal)
+  # и поиск лага раз в 30 минут — одним процессом.
+  ticks:
+    build: .
+    restart: unless-stopped
+    command: python -m leadlag.ticks
+    volumes:
+      - arb-data:/data
+    environment:
+      TZ: Europe/Moscow
+    env_file:
+      - path: .env
+        required: false
+    mem_limit: 768m   # ~430 МБ в работе: ccxt.pro по 8 биржам
+    cpus: 0.75
+    healthcheck:
+      disable: true
+
 volumes:
   arb-data:
