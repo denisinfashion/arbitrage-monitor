@@ -58,5 +58,19 @@ services:
     healthcheck:
       disable: true
 
+  # Спреды бессрочных фьючерсов между 8 биржами с funding: снимок раз в минуту.
+  spreads:
+    build: .
+    restart: unless-stopped
+    command: python -m leadlag.spreads
+    volumes:
+      - arb-data:/data
+    environment:
+      TZ: Europe/Moscow
+    mem_limit: 640m
+    cpus: 0.5
+    healthcheck:
+      disable: true
+
 volumes:
   arb-data:

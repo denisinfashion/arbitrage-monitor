@@ -50,6 +50,12 @@ class ScreenSettings:
     track_max_coins: int = 40
     keep_days: float = 3.0
 
+    # Спреды фьючерсов между биржами (spreads.py)
+    spread_hold_hours: float = 8.0          # сколько держим связку — для расчёта funding
+    spread_min_volume_usd: float = 500_000  # объём за 24 ч у каждой ноги
+    spread_min_pnl_pct: float = 0.10        # итог за удержание после комиссий и funding
+    spread_max_price_ratio: float = 1.30    # больше — скорее всего разные токены под одним тикером
+
     # Поиск лага (lag.py)
     lag_window_hours: int = 24     # за сколько часов оценивать устойчивость
     max_lag_s: int = 60            # сдвиги от −max до +max секунд
