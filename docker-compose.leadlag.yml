@@ -32,8 +32,11 @@ services:
     env_file:
       - path: .env
         required: false
-    mem_limit: 512m
+    # ccxt держит в памяти справочник рынков каждой биржи — на 20 бирж это ~0,5–0,8 ГБ
+    mem_limit: 1g
     cpus: 0.5
+    healthcheck:
+      disable: true   # проверка из образа — для интерфейса, у сборщика порта нет
 
 volumes:
   arb-data:

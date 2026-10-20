@@ -277,7 +277,8 @@ def build() -> Tuple[pd.DataFrame, dict]:
             log.warning("%s %s: %s", fn.__name__, venue, e)
             return None
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    # 4 потока, а не 20: справочники рынков ccxt тяжёлые, а сервер общий
+    with ThreadPoolExecutor(max_workers=4) as pool:
         fut_jobs = {v: pool.submit(safe, fetch_futures, v) for v in FUTURES}
         spot_jobs = {v: pool.submit(safe, fetch_spot, v) for v in SPOT}
         fut_rows = [r for j in fut_jobs.values() for r in (j.result() or [])]
