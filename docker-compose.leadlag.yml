@@ -1,0 +1,39 @@
+# Поиск зависимостей фьючерс ↔ DEX на общем сервере (рядом с TrueStats).
+#   docker compose -p arbitrage -f docker-compose.leadlag.yml up -d --build
+#
+# Интерфейс слушает только 127.0.0.1 — наружу не публикуется. Вход через туннель:
+#   ssh -L 8501:127.0.0.1:8501 unitrika-test   →   http://127.0.0.1:8501
+#
+# Лимиты памяти и CPU жёсткие: на сервере работает прод TrueStats.
+# История котировок по-прежнему собирается в GitHub Actions (снимок в Release),
+# поэтому сборщика history.collector здесь нет.
+
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8501:8501"
+    volumes:
+      - arb-data:/data
+    environment:
+      TZ: Europe/Moscow
+    mem_limit: 768m
+    cpus: 1.0
+
+  screener:
+    build: .
+    restart: unless-stopped
+    command: python -m leadlag.universe --every-hours 6
+    volumes:
+      - arb-data:/data
+    environment:
+      TZ: Europe/Moscow
+    env_file:
+      - path: .env
+        required: false
+    mem_limit: 512m
+    cpus: 0.5
+
+volumes:
+  arb-data:

@@ -42,3 +42,5 @@ jobs:
         run: python -m history.tests.test_taxes
       - name: Откуда берётся курс пула
         run: python -m history.tests.test_prices
+      - name: Кандидаты в связки фьючерс ↔ DEX
+        run: python -m history.tests.test_leadlag_universe
