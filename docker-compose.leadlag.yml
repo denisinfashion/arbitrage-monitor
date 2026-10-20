@@ -1,8 +1,10 @@
 # Поиск зависимостей фьючерс ↔ DEX на общем сервере (рядом с TrueStats).
-#   docker compose -p arbitrage -f docker-compose.leadlag.yml up -d --build
+# Выкладка — только скриптом:  ssh arbitrage sh /opt/arbitrage/deploy/deploy.sh
+# (arbitrage — ssh-имя того же сервера, что unitrika-test; у сканера всё своё:
+#  /opt/arbitrage, compose-проект arbitrage, журнал /var/log/arbitrage-deploy.log)
 #
 # Интерфейс слушает только 127.0.0.1 — наружу не публикуется. Вход через туннель:
-#   ssh -L 8501:127.0.0.1:8501 unitrika-test   →   http://127.0.0.1:8501
+#   ssh -L 8501:127.0.0.1:8501 arbitrage   →   http://127.0.0.1:8501
 #
 # Лимиты памяти и CPU жёсткие: на сервере работает прод TrueStats.
 # История котировок по-прежнему собирается в GitHub Actions (снимок в Release),
