@@ -13,6 +13,7 @@
 services:
   app:
     build: .
+    image: arbitrage-scanner:latest
     restart: unless-stopped
     ports:
       - "127.0.0.1:8501:8501"
@@ -20,11 +21,15 @@ services:
       - arb-data:/data
     environment:
       TZ: Europe/Moscow
+    env_file:
+      - path: .env
+        required: false
     mem_limit: 768m
     cpus: 1.0
 
   screener:
-    build: .
+    image: arbitrage-scanner:latest   # образ собирается один раз — в сервисе app
+    pull_policy: never
     restart: unless-stopped
     command: python -m leadlag.universe --every-hours 6
     volumes:
@@ -43,7 +48,8 @@ services:
   # Сделки по кандидатам (WebSocket бирж, блокчейн BSC/Base/Arbitrum, GeckoTerminal)
   # и поиск лага раз в 30 минут — одним процессом.
   ticks:
-    build: .
+    image: arbitrage-scanner:latest   # образ собирается один раз — в сервисе app
+    pull_policy: never
     restart: unless-stopped
     command: python -m leadlag.ticks
     volumes:
@@ -60,13 +66,17 @@ services:
 
   # Спреды бессрочных фьючерсов между 8 биржами с funding: снимок раз в минуту.
   spreads:
-    build: .
+    image: arbitrage-scanner:latest   # образ собирается один раз — в сервисе app
+    pull_policy: never
     restart: unless-stopped
     command: python -m leadlag.spreads
     volumes:
       - arb-data:/data
     environment:
       TZ: Europe/Moscow
+    env_file:
+      - path: .env      # TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+        required: false
     mem_limit: 640m
     cpus: 0.5
     healthcheck:

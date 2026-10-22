@@ -453,17 +453,25 @@ def main() -> None:
                    help="повторять каждые N часов (0 — один прогон)")
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if not args.every_hours:
+        run_once()
+        return
+    # По расписанию каждый прогон — отдельный процесс: справочники рынков ccxt
+    # занимают сотни мегабайт, и держать их часами между прогонами на общем
+    # сервере незачем. После перезапуска свежие данные не пересобираются.
+    import subprocess
+    import sys
+    period = args.every_hours * 3600
     while True:
-        started = time.time()
-        try:
-            run_once()
-        except Exception:
-            if not args.every_hours:
-                raise
-            log.exception("прогон упал, следующий по расписанию")
-        if not args.every_hours:
-            return
-        time.sleep(max(60.0, args.every_hours * 3600 - (time.time() - started)))
+        age = time.time() - (META_PATH.stat().st_mtime if META_PATH.exists() else 0)
+        if age < period:
+            log.info("данные свежие (%.1f ч), следующий прогон через %.1f ч", age / 3600, (period - age) / 3600)
+            time.sleep(period - age)
+            continue
+        code = subprocess.call([sys.executable, "-m", "leadlag.universe"])
+        if code:
+            log.error("прогон завершился с кодом %s, повтор через час", code)
+            time.sleep(3600)
 
 
 if __name__ == "__main__":

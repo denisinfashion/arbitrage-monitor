@@ -29,7 +29,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from . import ticks
+from . import notify, ticks
 from .settings import LEADLAG_DIR, ScreenSettings
 
 log = logging.getLogger(__name__)
@@ -202,6 +202,10 @@ def run_once(s: Optional[ScreenSettings] = None) -> pd.DataFrame:
     df.attrs["built_at"] = int(time.time())
     LEADLAG_DIR.mkdir(parents=True, exist_ok=True)
     df.to_parquet(RESULTS_PATH, index=False)
+    try:
+        notify.notify_lags(df, info, s)
+    except Exception:
+        log.exception("оповещения о лагах не отправлены")
     return df
 
 

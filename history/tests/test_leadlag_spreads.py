@@ -82,10 +82,44 @@ def test_select():
     check("осталась одна связка AAA binance → gate", got == {("AAA", "binance", "gate")}, str(got))
 
 
+def test_notify():
+    print("\n4. Оповещения: только устойчивые, без повторов")
+    import tempfile
+    from pathlib import Path
+
+    from history import alerts
+    from leadlag import notify
+
+    sent = []
+    orig = (alerts.send, alerts.configured, notify.STATE_PATH)
+    alerts.send = lambda text, *a, **k: sent.append(text) or True
+    alerts.configured = lambda: True
+    with tempfile.TemporaryDirectory() as d:
+        notify.STATE_PATH = Path(d) / "sent.json"
+        try:
+            m = pd.DataFrame([market("binance", 0.999, 1.000, 0.0, 8),
+                              market("gate", 1.010, 1.011, 0.0, 8),
+                              market("binance", 0.999, 1.000, 0.0, 8, coin="BLINK"),
+                              market("gate", 1.010, 1.011, 0.0, 8, coin="BLINK")])
+            s = ScreenSettings()
+            q = spreads.select(spreads.pairs(m, 8, now=NOW), s)
+            hot = pd.DataFrame({"coin": ["AAA", "BLINK"], "venue_l": ["binance"] * 2,
+                                "venue_s": ["gate"] * 2, "minutes_hot": [12, 3], "spread_avg": [1.0, 1.0]})
+            check("отправлена одна (мелькнувшая BLINK — нет)", notify.notify_spreads(q, hot, s) == 1,
+                  str(len(sent)))
+            check("в сообщении монета и ссылки бирж", "AAA" in sent[0] and "Binance" in sent[0])
+            check("повтор в течение 4 ч не шлётся", notify.notify_spreads(q, hot, s) == 0)
+            s.alerts_enabled = False
+            check("выключено — не шлётся", notify.notify_spreads(q, hot.assign(coin="AAA"), s) == 0)
+        finally:
+            alerts.send, alerts.configured, notify.STATE_PATH = orig
+
+
 def main() -> int:
     test_settlements()
     test_pair_math()
     test_select()
+    test_notify()
     print("\n" + "=" * 70)
     if FAILED:
         print(f"ПРОВАЛЕНО {len(FAILED)}:")

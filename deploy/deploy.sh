@@ -26,5 +26,7 @@ git -C "$DIR" log --oneline -1
 cd "$DIR"
 nice -n 10 docker compose -p arbitrage -f docker-compose.leadlag.yml up -d --build --remove-orphans
 docker compose -p arbitrage -f docker-compose.leadlag.yml ps
+# образы прежней схемы (по образу на сервис) — теперь один arbitrage-scanner
+docker image rm arbitrage-app arbitrage-screener arbitrage-ticks arbitrage-spreads 2>/dev/null || true
 rm -f /tmp/deploy-leadlag.sh /tmp/deploy-leadlag.log   # прежний временный скрипт
 echo "== OK =="

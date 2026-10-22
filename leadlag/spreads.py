@@ -34,6 +34,7 @@ import numpy as np
 import pandas as pd
 
 from . import funding as fnd
+from . import notify
 from .catalog import FUTURES, FUTURES_TAKER_PCT, futures_url
 from .settings import LEADLAG_DIR, ScreenSettings
 from .universe import _exchange, _num, split_multiplier
@@ -246,8 +247,13 @@ def main() -> None:
                 tmp = SNAPSHOT_PATH.with_suffix(".tmp")
                 m.to_parquet(tmp, index=False)
                 tmp.replace(SNAPSHOT_PATH)
-                p = pairs(m, ScreenSettings.load().spread_hold_hours)
+                s = ScreenSettings.load()
+                p = pairs(m, s.spread_hold_hours)
                 record(con, p, int(started))
+                try:
+                    notify.notify_spreads(select(p, s), persistence(con, notify.ALERT_HOT_WINDOW), s)
+                except Exception:
+                    log.exception("оповещения о спредах не отправлены")
                 log.info("снимок: %d рынков, %d монет на 2+ биржах, %d пар со спредом ≥ %.1f%% за %.0f с",
                          len(m), int((m.groupby("coin")["venue"].nunique() > 1).sum()),
                          int((p["spread_pct"] >= HIST_MIN_SPREAD_PCT).sum()), HIST_MIN_SPREAD_PCT,

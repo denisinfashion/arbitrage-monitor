@@ -19,7 +19,8 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from history.ui import FULL
-from leadlag import spreads
+from history import alerts
+from leadlag import notify, spreads
 from leadlag.catalog import FUTURES, FUTURES_TAKER_PCT
 from leadlag.settings import ScreenSettings
 
@@ -57,6 +58,21 @@ with st.sidebar:
                                          format_func=str.capitalize)
     mode = st.radio("Что ищем", ["любой доход", "спред (доход при схождении)", "funding (доход без схождения)"])
     st.caption("Комиссии тейкера, %: " + ", ".join(f"{k} {v:g}" for k, v in FUTURES_TAKER_PCT.items()))
+
+    with st.expander("Оповещения в Telegram"):
+        if not alerts.configured():
+            st.warning("Не настроены: нужны TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID в /opt/arbitrage/.env.")
+        s.alerts_enabled = st.toggle("Присылать", value=s.alerts_enabled)
+        s.alert_min_pnl_pct = st.number_input(
+            "Итог связки для оповещения, % от", 0.0, 50.0, float(s.alert_min_pnl_pct), 0.1,
+            help=f"Связка должна держаться {notify.ALERT_HOT_MINUTES} из {notify.ALERT_HOT_WINDOW} "
+                 f"минут. Повтор — не раньше чем через 4 ч. По умолчанию {defaults.alert_min_pnl_pct:g}%.")
+        s.alert_min_lag_hours = st.slider(
+            "Лаг: устойчивых часов для оповещения", 3, 24, int(s.alert_min_lag_hours),
+            help=f"По умолчанию {defaults.alert_min_lag_hours}.")
+        if st.button("Отправить проверочное сообщение", disabled=not alerts.configured(), **FULL):
+            ok = alerts.send("✅ Сканер связок: оповещения работают.")
+            st.success("Отправлено") if ok else st.error("Telegram не принял сообщение — проверьте токен и чат")
 
 if s.__dict__ != ScreenSettings.load().__dict__:
     s.save()

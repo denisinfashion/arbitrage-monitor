@@ -56,6 +56,11 @@ class ScreenSettings:
     spread_min_pnl_pct: float = 0.10        # итог за удержание после комиссий и funding
     spread_max_price_ratio: float = 1.30    # больше — скорее всего разные токены под одним тикером
 
+    # Оповещения в Telegram (notify.py)
+    alerts_enabled: bool = True
+    alert_min_pnl_pct: float = 0.5          # итог связки за удержание
+    alert_min_lag_hours: int = 12           # сколько часов лаг должен держаться
+
     # Поиск лага (lag.py)
     lag_window_hours: int = 24     # за сколько часов оценивать устойчивость
     max_lag_s: int = 60            # сдвиги от −max до +max секунд
