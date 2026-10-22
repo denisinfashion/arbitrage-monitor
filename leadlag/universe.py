@@ -233,8 +233,10 @@ def dex_pools(chain: str, address: str) -> List[dict]:
         price_usd, native = _num(p.get("priceUsd")), _num(p.get("priceNative"))
         if base == want:
             price, other = price_usd, (p.get("quoteToken") or {}).get("symbol")
+            other_addr = quote
         elif quote == want and price_usd and native:
             price, other = price_usd / native, (p.get("baseToken") or {}).get("symbol")
+            other_addr = base
         else:
             continue
         pools.append({
@@ -242,11 +244,26 @@ def dex_pools(chain: str, address: str) -> List[dict]:
             "pool": p.get("pairAddress"),
             "pool_url": p.get("url"),
             "pair_with": other,
+            "pair_with_address": other_addr,
             "price": price,
             "liquidity_usd": _num((p.get("liquidity") or {}).get("usd")) or 0.0,
             "volume_usd": _num((p.get("volume") or {}).get("h24")) or 0.0,
         })
     return pools
+
+
+def pick_pool(chain: str, pools: List[dict]) -> dict:
+    """Самый ликвидный пул. В EVM-сетях — среди пулов к стейблкоину или
+    WBNB/WETH: их сборщик сделок умеет пересчитать в доллары (evm.py).
+    Пул к другому токену — только если других нет."""
+    from .evm import EVM
+    c = EVM.get(chain)
+    if c is not None:
+        known = [p for p in pools
+                 if (p.get("pair_with_address") or "").lower() in c.stables | set(c.native)]
+        if known:
+            pools = known
+    return max(pools, key=lambda p: p["liquidity_usd"])
 
 
 # ------------------------------------------------------------------ конвейер
@@ -343,7 +360,7 @@ def build() -> Tuple[pd.DataFrame, dict]:
         for (coin, chain, addr), pools in pool.map(pools_for, lookups):
             if not pools:
                 continue
-            top = max(pools, key=lambda p: p["liquidity_usd"])
+            top = pick_pool(chain, pools)
             best_pool[(coin, chain)] = {
                 "chain": chain,
                 "contract": addr,

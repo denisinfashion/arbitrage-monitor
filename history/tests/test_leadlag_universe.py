@@ -91,11 +91,23 @@ def test_tradfi_names():
         check(f"не акция: {name}", not _TRADFI_NAME.search(name))
 
 
+def test_pick_pool():
+    print("\n5. Выбор пула: к стейблкоину или WBNB, а не к редкому токену")
+    from leadlag.universe import pick_pool
+    usdt = "0x55d398326f99059ff775485246999027b3197955"
+    pools = [{"pool": "rare", "liquidity_usd": 900_000, "pair_with_address": "0x" + "f" * 40},
+             {"pool": "usdt", "liquidity_usd": 300_000, "pair_with_address": usdt}]
+    check("BSC: пул к USDT, хоть и менее ликвидный", pick_pool("bsc", pools)["pool"] == "usdt")
+    check("Solana: просто самый ликвидный", pick_pool("solana", pools)["pool"] == "rare")
+    check("других нет — берётся редкий", pick_pool("bsc", pools[:1])["pool"] == "rare")
+
+
 def main() -> int:
     test_multiplier()
     test_pick_coin()
     test_filters()
     test_tradfi_names()
+    test_pick_pool()
     print("\n" + "=" * 70)
     if FAILED:
         print(f"ПРОВАЛЕНО {len(FAILED)}:")
