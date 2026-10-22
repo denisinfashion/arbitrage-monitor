@@ -150,6 +150,9 @@ def notify_lags(res: pd.DataFrame, meta: dict, s: ScreenSettings) -> int:
         return 0
     q = res[(~res["synchronous"]) & (res["hours_stable"] >= s.alert_min_lag_hours)
             & (res["lag_s"].fillna(0) >= 1)]
+    # ведомый-фьючерс — только на бирже, где торгуем (ведомый DEX — всегда)
+    f_kind, f_venue = q["follower"].str.split(":").str[0], q["follower"].str.split(":").str[1]
+    q = q[(f_kind != "fut") | f_venue.isin(s.futures_exchanges)]
     state, now, sent = load_state(), time.time(), 0
     for r in q.sort_values(["hours_stable", "corr"], ascending=False).itertuples():
         key = f"lag:{r.leader}:{r.follower}"

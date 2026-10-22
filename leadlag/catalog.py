@@ -30,6 +30,11 @@ FUTURES: Dict[str, FuturesVenue] = {v.key: v for v in [
     FuturesVenue("bingx", "bingx", {"defaultType": "swap"}, "https://bingx.com/en/perpetual/{id}/"),
 ]}
 
+# Биржи, на которых торгуем, — по умолчанию. MEXC уходит с рынка РФ: данные по нему
+# собираются (как ориентир цены), но в связки, оповещения и бумажную торговлю
+# он не попадает, пока его не отметить в интерфейсе.
+FUTURES_TRADABLE_DEFAULT = [k for k in FUTURES if k != "mexc"]
+
 
 # Тейкерская комиссия фьючерсов, % — базовый уровень без VIP и скидок за токен биржи.
 FUTURES_TAKER_PCT: Dict[str, float] = {

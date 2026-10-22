@@ -49,7 +49,7 @@ def test_pick_coin():
 
 def test_filters():
     print("\n3. Галочки и пороги")
-    base = dict(fut_venue="mexc", chain="bsc", spot_on="", fut_volume_usd=5e6,
+    base = dict(fut_venue="bybit", chain="bsc", spot_on="", fut_volume_usd=5e6,
                 fut_range_pct=12.0, dex_liquidity_usd=4e5, dex_volume_usd=2e5,
                 price_gap_pct=0.4, coin="AAA")
     rows = [
@@ -62,6 +62,7 @@ def test_filters():
         {**base, "coin": "GAP", "price_gap_pct": 25.0},
         {**base, "coin": "ETH1", "chain": "ethereum"},
         {**base, "coin": "OTHER", "fut_venue": "unknownex"},
+        {**base, "coin": "MEXC1", "fut_venue": "mexc"},           # уходит из РФ — по умолчанию не торгуем
         {**base, "coin": "MU", "tradfi": True},                  # токенизированная акция
     ]
     rows = [{"tradfi": False, **r} for r in rows]

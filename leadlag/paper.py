@@ -34,7 +34,7 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 from . import lag
 from .catalog import FUTURES, FUTURES_TAKER_PCT
-from .settings import LEADLAG_DIR
+from .settings import LEADLAG_DIR, ScreenSettings
 
 log = logging.getLogger(__name__)
 
@@ -113,6 +113,9 @@ def pick_pairs() -> List[Pair]:
         return []
     q = res[(~res["synchronous"]) & (res["hours_stable"] >= MIN_STABLE_HOURS)
             & res["leader"].str.startswith("fut:") & res["follower"].str.startswith("fut:")]
+    # торгуем ведомого — он должен быть на бирже, где мы торгуем
+    tradable = set(ScreenSettings.load().futures_exchanges)
+    q = q[q["follower"].str.split(":").str[1].isin(tradable)]
     q = q.sort_values(["hours_stable", "corr"], ascending=False).drop_duplicates("follower")
     return [Pair(r.leader[4:], r.follower[4:]) for r in q.head(MAX_PAIRS).itertuples()]
 

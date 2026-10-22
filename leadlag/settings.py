@@ -14,7 +14,7 @@ from typing import List
 
 from history.config import DATA_DIR
 
-from .catalog import CHAINS_DEFAULT, FUTURES, SPOT_TIER1_DEFAULT
+from .catalog import CHAINS_DEFAULT, FUTURES_TRADABLE_DEFAULT, SPOT_TIER1_DEFAULT
 
 log = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ SETTINGS_PATH = LEADLAG_DIR / "settings.json"
 
 @dataclass
 class ScreenSettings:
-    futures_exchanges: List[str] = field(default_factory=lambda: list(FUTURES))
+    futures_exchanges: List[str] = field(default_factory=lambda: list(FUTURES_TRADABLE_DEFAULT))
     tier1_spot: List[str] = field(default_factory=lambda: list(SPOT_TIER1_DEFAULT))
     chains: List[str] = field(default_factory=lambda: list(CHAINS_DEFAULT))
 
