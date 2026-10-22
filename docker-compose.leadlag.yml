@@ -82,5 +82,20 @@ services:
     healthcheck:
       disable: true
 
+  # Бумажная торговля на лаге: стаканы ведущих и ведомых фьючерсов, без денег.
+  paper:
+    image: arbitrage-scanner:latest
+    pull_policy: never
+    restart: unless-stopped
+    command: python -m leadlag.paper
+    volumes:
+      - arb-data:/data
+    environment:
+      TZ: Europe/Moscow
+    mem_limit: 384m
+    cpus: 0.5
+    healthcheck:
+      disable: true
+
 volumes:
   arb-data:

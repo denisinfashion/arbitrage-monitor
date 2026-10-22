@@ -115,11 +115,25 @@ def test_notify():
             alerts.send, alerts.configured, notify.STATE_PATH = orig
 
 
+def test_paper_vwap():
+    print("\n5. Бумажная торговля: исполнение по стакану")
+    from leadlag import paper
+    levels = [[1.00, 300], [1.01, 500], [1.02, 1000]]
+    price, filled = paper.vwap(levels, 1000)
+    # 300 × 1,00 + 500 × 1,01 = 805; оставшиеся 195 по 1,02
+    qty = 300 + 500 + 195 / 1.02
+    check("средняя цена на $1000", close(price, 1000 / qty, 1e-12), f"{price:.6f}")
+    check("исполнено полностью", close(filled, 1000, 1e-9))
+    price, filled = paper.vwap([[1.0, 100]], 1000)
+    check("тонкий стакан — частичное исполнение", close(filled, 100, 1e-9) and close(price, 1.0))
+
+
 def main() -> int:
     test_settlements()
     test_pair_math()
     test_select()
     test_notify()
+    test_paper_vwap()
     print("\n" + "=" * 70)
     if FAILED:
         print(f"ПРОВАЛЕНО {len(FAILED)}:")
