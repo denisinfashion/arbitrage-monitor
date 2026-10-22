@@ -64,15 +64,34 @@ def _a(url: Optional[str], text: str) -> str:
 
 # ------------------------------------------------------------------ спреды
 
+def _avg(r) -> str:
+    """«(средний за час +0,41%, за сутки +0,35%)» — если средние посчитаны."""
+    parts = []
+    for name, label in (("spread_avg_1h", "за час"), ("spread_avg_24h", "за сутки")):
+        v = getattr(r, name, None)
+        if v is not None and v == v:
+            parts.append(f"{label} {v:+.2f}%")
+    return f" (средний {', '.join(parts)})" if parts else ""
+
+
+def _depth(r) -> str:
+    v1, v5 = getattr(r, "spread_1000", None), getattr(r, "spread_5000", None)
+    fmt = lambda v: f"{v:+.2f}%" if v is not None and v == v else "не хватает стакана"
+    if v1 is None and v5 is None:
+        return ""
+    return f"Спред на объёме: $1 000 {fmt(v1)}, $5 000 {fmt(v5)}\n"
+
+
 def spread_message(r, hold_h: float) -> str:
     carry = r.pnl_carry_pct >= r.pnl_converge_pct
     head = "💰 Funding-связка" if carry else "↔️ Спред фьючерсов"
     lines = [
         f"<b>{head}: {html.escape(r.coin)}</b>",
         f"Лонг {_a(r.url_l, r.venue_l.capitalize())} · шорт {_a(r.url_s, r.venue_s.capitalize())}",
-        f"Спред {r.spread_pct:+.2f}% · funding {r.funding_day_pct:+.2f}% в сутки",
+        f"Спред {r.spread_pct:+.2f}%{_avg(r)} · funding {r.funding_day_pct:+.2f}% в сутки",
         f"Итог за {hold_h:g} ч: спред сошёлся <b>{r.pnl_converge_pct:+.2f}%</b>, "
         f"только funding <b>{r.pnl_carry_pct:+.2f}%</b> (после комиссий {r.fees_pct:.2f}%)",
+        _depth(r) +
         f"Держится {int(r.minutes_hot)} мин из {ALERT_HOT_WINDOW} · объём меньшей ноги "
         f"${r.min_volume_usd / 1e6:.1f} млн",
     ]

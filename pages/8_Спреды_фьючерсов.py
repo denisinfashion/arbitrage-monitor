@@ -92,7 +92,15 @@ elif mode.startswith("funding"):
 
 with closing(spreads.hist_connect()) as con:
     hot = spreads.persistence(con, 60)
+    avg = spreads.averages(con)
 q = q.merge(hot, on=["coin", "venue_l", "venue_s"], how="left")
+q = q.merge(avg, on=["coin", "venue_l", "venue_s"], how="left")
+depth = pd.read_parquet(spreads.DEPTH_PATH) if spreads.DEPTH_PATH.exists() else None
+if depth is not None:
+    q = q.merge(depth, on=["coin", "venue_l", "venue_s"], how="left")
+for n in spreads.DEPTH_NOTIONALS:
+    if f"spread_{n}" not in q:
+        q[f"spread_{n}"] = None
 
 c = st.columns(4)
 c[0].metric("Связок", len(q))
@@ -122,6 +130,10 @@ table = pd.DataFrame({
     "Шорт": q["venue_s"].str.capitalize(),
     "Ссылка шорта": q["url_s"],
     "Спред, %": q["spread_pct"].round(3),
+    "Средний спред 1 ч, %": q["spread_avg_1h"].round(3),
+    "Средний спред 24 ч, %": q["spread_avg_24h"].round(3),
+    "Спред на $1 000, %": pd.to_numeric(q["spread_1000"]).round(3),
+    "Спред на $5 000, %": pd.to_numeric(q["spread_5000"]).round(3),
     "Комиссии, %": q["fees_pct"].round(3),
     f"Funding за {s.spread_hold_hours:g} ч, %": q["funding_hold_pct"].round(3),
     "Funding в сутки, %": q["funding_day_pct"].round(3),
@@ -140,6 +152,13 @@ st.dataframe(table, hide_index=True, height=560, **FULL, column_config={
     "Ссылка шорта": st.column_config.LinkColumn(display_text="открыть"),
     "Объём меньшей ноги, $": st.column_config.NumberColumn(format="%,.0f"),
 })
+st.caption(f"«Спред на $1 000 / $5 000» — по средней цене исполнения такого объёма на каждой ноге "
+           f"(стаканы {spreads.DEPTH_TOP_PAIRS} лучших связок, раз в минуту). Пусто — стакана не хватает "
+           "на этот объём или связка не в числе лучших.")
+st.caption("Средний спред — по минутным снимкам с момента, когда пара впервые за сутки поднялась "
+           f"до {spreads.TRACK_MIN_SPREAD_PCT:g}% (объём каждой ноги от "
+           f"${spreads.TRACK_MIN_VOLUME_USD:,.0f}); дальше учитываются все минуты, включая низкий спред. "
+           "Средний близок к текущему — спред устойчивый; намного ниже — текущий всплеск.")
 st.caption("«Минут в спреде из 60» — сколько минутных снимков за последний час спред этой пары "
            f"был не меньше {spreads.HIST_MIN_SPREAD_PCT:g}%. Спред, который держится, — "
            "кандидат в работу; мелькнувший — скорее шум котировок.")

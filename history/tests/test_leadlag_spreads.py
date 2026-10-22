@@ -128,12 +128,35 @@ def test_paper_vwap():
     check("тонкий стакан — частичное исполнение", close(filled, 100, 1e-9) and close(price, 1.0))
 
 
+def test_averages():
+    print("\n6. Средний спред: все минуты после первого всплеска")
+    import sqlite3
+    import time as _t
+
+    spreads._tracked.clear()
+    con = sqlite3.connect(":memory:")
+    con.executescript(spreads.SCHEMA)
+    now = int(_t.time())
+    for i, ask_gate in enumerate([1.010, 1.0005, 1.0005, 1.0005]):   # 1% одну минуту, потом ~0%
+        m = pd.DataFrame([market("binance", 0.999, 1.000, 0.0, 8),
+                          market("gate", ask_gate - 0.0005, ask_gate, 0.0, 8)])
+        spreads.record(con, spreads.pairs(m, 8, now=NOW), now - 300 + i * 60)
+    a = spreads.averages(con)
+    r = a[(a.venue_l == "binance") & (a.venue_s == "gate")].iloc[0]
+    check("в средний вошли все 4 минуты", r.minutes_1h == 4, str(r.minutes_1h))
+    check("средний за час ≈ (0,95 + 3 × 0) / 4", abs(r.spread_avg_1h - 0.95 / 4) < 0.01,
+          f"{r.spread_avg_1h:.3f}")
+    check("средний за сутки совпадает", abs(r.spread_avg_24h - r.spread_avg_1h) < 1e-9)
+    con.close()
+
+
 def main() -> int:
     test_settlements()
     test_pair_math()
     test_select()
     test_notify()
     test_paper_vwap()
+    test_averages()
     print("\n" + "=" * 70)
     if FAILED:
         print(f"ПРОВАЛЕНО {len(FAILED)}:")

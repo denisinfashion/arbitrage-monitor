@@ -28,7 +28,7 @@ import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -42,18 +42,38 @@ from .universe import _exchange, _num, split_multiplier
 log = logging.getLogger(__name__)
 
 SNAPSHOT_PATH = LEADLAG_DIR / "spreads_now.parquet"
+DEPTH_PATH = LEADLAG_DIR / "spreads_depth.parquet"
+DEPTH_TOP_PAIRS = 40              # для скольких лучших связок смотреть стаканы
+DEPTH_NOTIONALS = (1000, 5000)    # объём сделки на ногу, $
 HIST_DB = LEADLAG_DIR / "spreads.sqlite"
 SNAPSHOT_EVERY_S = 60
 FUNDING_EVERY_S = 300
 MARKETS_EVERY_S = 6 * 3600
 STALE_S = 180            # котировка старше — цена могла устареть
 HIST_MIN_SPREAD_PCT = 0.2
+# Средний спред: пара попадает под учёт, как только спред ≥ TRACK_MIN_SPREAD_PCT при
+# объёме каждой ноги ≥ TRACK_MIN_VOLUME_USD, и дальше пишется каждую минуту сутки —
+# иначе среднее считалось бы только по «горячим» минутам и было бы завышено.
+TRACK_MIN_SPREAD_PCT = 0.1
+TRACK_MIN_VOLUME_USD = 100_000
+TRACK_FOR_S = 86400
+_tracked: Dict[Tuple[str, str, str], float] = {}   # пара → до какого момента учитывать
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS spread_hist (
     ts INTEGER NOT NULL, coin TEXT NOT NULL, long TEXT NOT NULL, short TEXT NOT NULL,
     spread_pct REAL, funding_day_pct REAL,
     PRIMARY KEY (coin, long, short, ts)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS spread_recent (      -- поминутно, последний час
+    ts INTEGER NOT NULL, coin TEXT NOT NULL, long TEXT NOT NULL, short TEXT NOT NULL,
+    spread_pct REAL,
+    PRIMARY KEY (coin, long, short, ts)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS spread_hourly (      -- суммы по часам, неделя
+    hour INTEGER NOT NULL, coin TEXT NOT NULL, long TEXT NOT NULL, short TEXT NOT NULL,
+    s REAL NOT NULL, n INTEGER NOT NULL,
+    PRIMARY KEY (coin, long, short, hour)
 ) WITHOUT ROWID;
 """
 
@@ -78,6 +98,17 @@ class Venue:
                       if m.get("swap") and m.get("linear") and m.get("quote") == "USDT"
                       and m.get("active") is not False}
         self.markets_at = time.time()
+
+    def depth(self, symbol: str) -> Optional[Tuple[list, list]]:
+        """Стакан (bids, asks) с ценой за 1 монету и объёмом в монетах."""
+        m = self.swaps.get(symbol)
+        if m is None:
+            return None
+        ob = self.ex.fetch_order_book(symbol, 20)
+        size = float(m.get("contractSize") or 1)           # объём бывает в контрактах
+        _, mult = split_multiplier(str(m["base"]).upper())  # 1000PEPE: цена за 1000 монет
+        conv = lambda side: [[lv[0] / mult, lv[1] * size * mult] for lv in side]
+        return conv(ob["bids"]), conv(ob["asks"])
 
     def snapshot(self) -> List[dict]:
         now = time.time()
@@ -175,6 +206,38 @@ def explain(r, now: float) -> str:
     return "; ".join(out)
 
 
+def depth_spreads(q: pd.DataFrame, venues: Dict[str, "Venue"]) -> pd.DataFrame:
+    """Спред по средней цене исполнения на DEPTH_NOTIONALS долларов: покупка по
+    уровням ask лонга, продажа по уровням bid шорта. Тонкий стакан — спред на
+    объёме меньше, чем по лучшей цене, или его нет совсем."""
+    from .paper import vwap
+    books: Dict[Tuple[str, str], Optional[Tuple[list, list]]] = {}
+
+    def book(venue: str, symbol: str):
+        key = (venue, symbol)
+        if key not in books:
+            try:
+                books[key] = venues[venue].depth(symbol)
+            except Exception as e:
+                log.warning("стакан %s %s: %s", venue, symbol, str(e)[:120])
+                books[key] = None
+        return books[key]
+
+    rows = []
+    for r in q.head(DEPTH_TOP_PAIRS).itertuples():
+        bl, bs = book(r.venue_l, r.symbol_l), book(r.venue_s, r.symbol_s)
+        row = {"coin": r.coin, "venue_l": r.venue_l, "venue_s": r.venue_s}
+        for n in DEPTH_NOTIONALS:
+            buy, got_l = vwap(bl[1], n) if bl else (None, 0)
+            sell, got_s = vwap(bs[0], n) if bs else (None, 0)
+            full = got_l >= n * 0.999 and got_s >= n * 0.999
+            row[f"spread_{n}"] = (sell / buy - 1) * 100 if buy and sell and full else None
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    out["depth_ts"] = int(time.time())
+    return out
+
+
 def select(p: pd.DataFrame, s: ScreenSettings) -> pd.DataFrame:
     """Пороги и галочки из настроек; из двух направлений пары — лучшее."""
     if p is None or p.empty:
@@ -205,7 +268,37 @@ def record(con, p: pd.DataFrame, ts: int) -> None:
                     [(ts, r.coin, r.venue_l, r.venue_s, float(r.spread_pct), float(r.funding_day_pct))
                      for r in hot.itertuples()])
     con.execute("DELETE FROM spread_hist WHERE ts < ?", (ts - 7 * 86400,))
+
+    ok = p[(p["min_volume_usd"] >= TRACK_MIN_VOLUME_USD) & (p["price_ratio"] <= 1.3)]
+    for r in ok[ok["spread_pct"] >= TRACK_MIN_SPREAD_PCT].itertuples():
+        _tracked[(r.coin, r.venue_l, r.venue_s)] = ts + TRACK_FOR_S
+    for k in [k for k, until in _tracked.items() if until < ts]:
+        del _tracked[k]
+    keys = list(zip(ok["coin"], ok["venue_l"], ok["venue_s"]))
+    rows = [(*k, float(v)) for k, v in zip(keys, ok["spread_pct"]) if k in _tracked]
+    hour = ts // 3600 * 3600
+    con.executemany("INSERT OR REPLACE INTO spread_recent VALUES (?,?,?,?,?)",
+                    [(ts, c, l, sh, v) for c, l, sh, v in rows])
+    con.executemany("INSERT INTO spread_hourly VALUES (?,?,?,?,?,1) ON CONFLICT(coin, long, short, hour) "
+                    "DO UPDATE SET s = s + excluded.s, n = n + 1",
+                    [(hour, c, l, sh, v) for c, l, sh, v in rows])
+    con.execute("DELETE FROM spread_recent WHERE ts < ?", (ts - 3900,))
+    con.execute("DELETE FROM spread_hourly WHERE hour < ?", (ts - 8 * 86400,))
     con.commit()
+
+
+def averages(con) -> pd.DataFrame:
+    """Средний спред пары за последний час (поминутно) и за сутки (по часовым суммам)."""
+    now = int(time.time())
+    h1 = pd.read_sql_query(
+        "SELECT coin, long AS venue_l, short AS venue_s, avg(spread_pct) AS spread_avg_1h, "
+        "count(*) AS minutes_1h FROM spread_recent WHERE ts >= ? GROUP BY coin, long, short",
+        con, params=(now - 3600,))
+    h24 = pd.read_sql_query(
+        "SELECT coin, long AS venue_l, short AS venue_s, sum(s) / sum(n) AS spread_avg_24h, "
+        "sum(n) AS minutes_24h FROM spread_hourly WHERE hour >= ? GROUP BY coin, long, short",
+        con, params=(now // 3600 * 3600 - 23 * 3600,))
+    return h1.merge(h24, on=["coin", "venue_l", "venue_s"], how="outer")
 
 
 def persistence(con, window_min: int = 60) -> pd.DataFrame:
@@ -251,7 +344,16 @@ def main() -> None:
                 p = pairs(m, s.spread_hold_hours)
                 record(con, p, int(started))
                 try:
-                    notify.notify_spreads(select(p, s), persistence(con, notify.ALERT_HOT_WINDOW), s)
+                    q = select(p, s).merge(averages(con), on=["coin", "venue_l", "venue_s"], how="left")
+                    try:
+                        d = depth_spreads(q, venues)
+                        tmp = DEPTH_PATH.with_suffix(".tmp")
+                        d.to_parquet(tmp, index=False)
+                        tmp.replace(DEPTH_PATH)
+                        q = q.merge(d, on=["coin", "venue_l", "venue_s"], how="left")
+                    except Exception:
+                        log.exception("глубина стаканов не посчитана")
+                    notify.notify_spreads(q, persistence(con, notify.ALERT_HOT_WINDOW), s)
                 except Exception:
                     log.exception("оповещения о спредах не отправлены")
                 log.info("снимок: %d рынков, %d монет на 2+ биржах, %d пар со спредом ≥ %.1f%% за %.0f с",
